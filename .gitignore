@@ -30,6 +30,7 @@ data/
 logs/
 results/
 saved_models/
+visualization/
 findings.md
 progress.md
 task_plan.md
