@@ -30,7 +30,7 @@ class PCWNetConfig:
     decoder_layers: int = 5
     decoder_ffn_dim: int = 2048
     anchor_grid_size: Tuple[int, int] = (32, 32)
-    topk: int = 3
+    topk: int = 5
     local_softargmax_radius: int = 1
     refinement_levels: Tuple[str, ...] = ("layer3", "layer2", "layer1")
     refinement_dim: int = 256

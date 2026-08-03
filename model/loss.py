@@ -17,6 +17,10 @@ class LossConfig:
     box_l1_weight: float = 2.0
     giou_weight: float = 2.0
     certainty_weight: float = 0.25
+    selection_weight: float = 0.5
+    selected_box_weight: float = 1.0
+    anchor_soft_weight: float = 0.5
+    anchor_soft_sigma: float = 0.75
     robust_alpha: float = 0.5
     robust_scale: float = 0.03
 
@@ -66,6 +70,30 @@ def aligned_giou_loss(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tenso
     return 1 - giou
 
 
+def spatial_anchor_distribution(
+    target_states: torch.Tensor,
+    anchor_h: int,
+    anchor_w: int,
+    sigma: float,
+) -> torch.Tensor:
+    """Build a Gaussian target distribution over the anchor grid."""
+    dtype = target_states.dtype
+    device = target_states.device
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(anchor_h, device=device, dtype=dtype),
+        torch.arange(anchor_w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    grid_x = (grid_x + 0.5) / anchor_w
+    grid_y = (grid_y + 0.5) / anchor_h
+    distance = (
+        ((grid_x[None] - target_states[:, None, None, 0]) * anchor_w).square()
+        + ((grid_y[None] - target_states[:, None, None, 1]) * anchor_h).square()
+    )
+    distribution = torch.exp(-0.5 * distance / max(sigma, 1e-6) ** 2)
+    return distribution.flatten(1) / distribution.flatten(1).sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+
 def robust_charbonnier(
     error: torch.Tensor, alpha: float, scale: float
 ) -> torch.Tensor:
@@ -108,10 +136,21 @@ class Criterion(nn.Module):
         center_x = (target_states[:, 0] * anchor_w).long().clamp(0, anchor_w - 1)
         center_y = (target_states[:, 1] * anchor_h).long().clamp(0, anchor_h - 1)
         target_anchor = center_y * anchor_w + center_x
-        anchor_loss = F.cross_entropy(
+        hard_anchor_loss = F.cross_entropy(
             outputs["anchor_logits_flat"],
             target_anchor,
         )
+        anchor_target = spatial_anchor_distribution(
+            target_states,
+            anchor_h,
+            anchor_w,
+            cfg.anchor_soft_sigma,
+        )
+        soft_anchor_loss = -(
+            anchor_target * F.log_softmax(outputs["anchor_logits_flat"], dim=-1)
+        ).sum(dim=1).mean()
+        soft_weight = min(max(cfg.anchor_soft_weight, 0.0), 1.0)
+        anchor_loss = (1.0 - soft_weight) * hard_anchor_loss + soft_weight * soft_anchor_loss
 
         warp_loss = anchor_loss * 0.0
         refinement_states = outputs["refinement_states"]
@@ -140,18 +179,34 @@ class Criterion(nn.Module):
         certainty_loss = F.binary_cross_entropy_with_logits(
             certainty_logits, candidate_ious.detach()
         )
+        selection_logits = (
+            outputs["candidate_anchor_scores"].clamp_min(1e-8).log()
+            + F.logsigmoid(certainty_logits)
+        )
+        selection_loss = F.cross_entropy(selection_logits, best_index)
+        selected_index = outputs["selected_indices"]
+        selected_boxes = candidate_boxes[rows, selected_index]
+        selected_box_l1_loss = F.l1_loss(selected_boxes, target_boxes)
+        selected_giou_loss = aligned_giou_loss(selected_boxes, target_boxes).mean()
         total = (
             cfg.anchor_weight * anchor_loss
             + cfg.box_l1_weight * box_l1_loss
             + cfg.giou_weight * giou_loss
             + cfg.warp_weight * warp_loss
             + cfg.certainty_weight * certainty_loss
+            + cfg.selection_weight * selection_loss
+            + cfg.selected_box_weight * (selected_box_l1_loss + selected_giou_loss)
         )
         return {
             "loss": total,
             "loss_anchor": anchor_loss,
+            "loss_anchor_hard": hard_anchor_loss,
+            "loss_anchor_soft": soft_anchor_loss,
             "loss_warp": warp_loss,
             "loss_box_l1": box_l1_loss,
             "loss_giou": giou_loss,
             "loss_certainty": certainty_loss,
+            "loss_selection": selection_loss,
+            "loss_selected_box_l1": selected_box_l1_loss,
+            "loss_selected_giou": selected_giou_loss,
         }

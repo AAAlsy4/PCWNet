@@ -27,10 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", default="./data")
     parser.add_argument("--data_name", default="CVOGL_DroneAerial")
     parser.add_argument("--img_size", type=int, default=1024)
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--num_workers", type=int, default=24)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--backbone_lr", type=float, default=1e-5)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--warmup_epochs", type=int, default=2)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--no_pretrained_backbones", dest="pretrained_backbones", action="store_false")
     parser.add_argument("--train_coarse_backbone", dest="freeze_coarse", action="store_false")
@@ -64,6 +67,44 @@ def build_model(args: argparse.Namespace) -> PCWNet:
         pretrained_backbones=args.pretrained_backbones,
         freeze_coarse=args.freeze_coarse and args.pretrained_backbones,
     ))
+
+
+def build_optimizer(args: argparse.Namespace, model: PCWNet) -> torch.optim.Optimizer:
+    backbone_parameters = []
+    head_parameters = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith(("query_fine_encoder.", "reference_fine_encoder.")):
+            backbone_parameters.append(parameter)
+        else:
+            head_parameters.append(parameter)
+
+    parameter_groups = [{"params": head_parameters, "lr": args.lr}]
+    if backbone_parameters:
+        parameter_groups.append({"params": backbone_parameters, "lr": args.backbone_lr})
+    return torch.optim.AdamW(
+        parameter_groups,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+
+def build_scheduler(
+    args: argparse.Namespace, optimizer: torch.optim.Optimizer
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup_epochs = min(max(args.warmup_epochs, 0), max(args.epochs - 1, 0))
+    min_factor = min(max(args.min_lr / max(args.lr, 1e-12), 0.0), 1.0)
+
+    def schedule(epoch: int) -> float:
+        if warmup_epochs and epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        decay_epochs = max(args.epochs - warmup_epochs - 1, 1)
+        progress = min(max((epoch - warmup_epochs) / decay_epochs, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        return min_factor + (1.0 - min_factor) * float(cosine)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
 
 def build_loader(args: argparse.Namespace, split: str, augment: bool) -> DataLoader:
@@ -120,7 +161,17 @@ def run_epoch(
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "iou": 0.0, "acc25": 0.0, "acc50": 0.0, "count": 0.0}
+    totals = {
+        "loss": 0.0,
+        "iou": 0.0,
+        "acc25": 0.0,
+        "acc50": 0.0,
+        "oracle_iou": 0.0,
+        "oracle_acc25": 0.0,
+        "oracle_acc50": 0.0,
+        "selection_acc": 0.0,
+        "count": 0.0,
+    }
     start = time.time()
     for batch_index, raw_batch in enumerate(loader):
         query, reference, prompt, boxes, _, _ = move_batch(raw_batch, device)
@@ -140,6 +191,17 @@ def run_epoch(
         totals["iou"] += float(ious.sum())
         totals["acc25"] += float((ious >= 0.25).sum())
         totals["acc50"] += float((ious >= 0.50).sum())
+        candidate_boxes = outputs.get("candidate_boxes")
+        if candidate_boxes is not None:
+            candidate_targets = target[:, None].expand_as(candidate_boxes)
+            candidate_ious = aligned_iou(candidate_boxes.detach(), candidate_targets)
+            oracle_ious, oracle_indices = candidate_ious.max(dim=1)
+            totals["oracle_iou"] += float(oracle_ious.sum())
+            totals["oracle_acc25"] += float((oracle_ious >= 0.25).sum())
+            totals["oracle_acc50"] += float((oracle_ious >= 0.50).sum())
+            totals["selection_acc"] += float(
+                (outputs["selected_indices"].detach() == oracle_indices).sum()
+            )
         totals["count"] += n
         if batch_index % max(print_freq, 1) == 0:
             mode = "train" if training else "eval"
@@ -152,7 +214,24 @@ def run_epoch(
                 flush=True,
             )
     count = max(totals["count"], 1.0)
-    return {key: totals[key] / count for key in ("loss", "iou", "acc25", "acc50")}
+    return {
+        key: totals[key] / count
+        for key in (
+            "loss",
+            "iou",
+            "acc25",
+            "acc50",
+            "oracle_iou",
+            "oracle_acc25",
+            "oracle_acc50",
+            "selection_acc",
+        )
+    }
+
+
+def checkpoint_score(metrics: Dict[str, float]) -> float:
+    """Prioritize the stricter threshold while retaining acc25 as a guardrail."""
+    return 0.4 * metrics["acc25"] + 0.6 * metrics["acc50"]
 
 
 def save_checkpoint(path: str, model: PCWNet, epoch: int, metrics: Dict[str, float]) -> None:
@@ -186,20 +265,25 @@ def main() -> None:
         print(json.dumps(metrics, indent=2))
         return
 
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(args, model)
+    scheduler = build_scheduler(args, optimizer)
     train_loader = build_loader(args, "train", True)
     val_loader = build_loader(args, "val", False)
-    best_iou = float("-inf")
+    best_score = float("-inf")
     for epoch in range(args.epochs):
         train_metrics = run_epoch(model, criterion, train_loader, optimizer, device, epoch, args.print_freq)
         val_metrics = run_epoch(model, criterion, val_loader, None, device, epoch, args.print_freq)
-        print(f"epoch={epoch} train={train_metrics} val={val_metrics}", flush=True)
-        if val_metrics["iou"] > best_iou:
-            best_iou = val_metrics["iou"]
+        score = checkpoint_score(val_metrics)
+        val_metrics["selection_score"] = score
+        current_lr = max(group["lr"] for group in optimizer.param_groups)
+        print(
+            f"epoch={epoch} train={train_metrics} val={val_metrics} "
+            f"lr={current_lr:.6g}",
+            flush=True,
+        )
+        scheduler.step()
+        if score > best_score:
+            best_score = score
             save_checkpoint(args.checkpoint, model, epoch, val_metrics)
             print(f"saved {args.checkpoint}", flush=True)
 

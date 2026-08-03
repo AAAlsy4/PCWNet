@@ -30,6 +30,9 @@ data/
 logs/
 results/
 saved_models/
+findings.md
+progress.md
+task_plan.md
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
