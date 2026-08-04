@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--warmup_epochs", type=int, default=2)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--certainty_weight", type=float, default=0.5)
+    parser.add_argument("--selection_weight", type=float, default=1.0)
+    parser.add_argument("--selection_temperature", type=float, default=0.1)
+    parser.add_argument("--anchor_score_power", type=float, default=1.0)
     parser.add_argument("--no_pretrained_backbones", dest="pretrained_backbones", action="store_false")
     parser.add_argument("--train_coarse_backbone", dest="freeze_coarse", action="store_false")
     parser.set_defaults(pretrained_backbones=True, freeze_coarse=True)
@@ -66,6 +70,15 @@ def build_model(args: argparse.Namespace) -> PCWNet:
     return PCWNet(PCWNetConfig(
         pretrained_backbones=args.pretrained_backbones,
         freeze_coarse=args.freeze_coarse and args.pretrained_backbones,
+        anchor_score_power=args.anchor_score_power,
+    ))
+
+
+def build_criterion(args: argparse.Namespace) -> Criterion:
+    return Criterion(LossConfig(
+        certainty_weight=args.certainty_weight,
+        selection_weight=args.selection_weight,
+        selection_temperature=args.selection_temperature,
     ))
 
 
@@ -170,6 +183,7 @@ def run_epoch(
         "oracle_acc25": 0.0,
         "oracle_acc50": 0.0,
         "selection_acc": 0.0,
+        "selection_regret": 0.0,
         "count": 0.0,
     }
     start = time.time()
@@ -202,6 +216,7 @@ def run_epoch(
             totals["selection_acc"] += float(
                 (outputs["selected_indices"].detach() == oracle_indices).sum()
             )
+            totals["selection_regret"] += float((oracle_ious - ious).sum())
         totals["count"] += n
         if batch_index % max(print_freq, 1) == 0:
             mode = "train" if training else "eval"
@@ -225,13 +240,14 @@ def run_epoch(
             "oracle_acc25",
             "oracle_acc50",
             "selection_acc",
+            "selection_regret",
         )
     }
 
 
 def checkpoint_score(metrics: Dict[str, float]) -> float:
     """Prioritize the stricter threshold while retaining acc25 as a guardrail."""
-    return 0.4 * metrics["acc25"] + 0.6 * metrics["acc50"]
+    return 0.25 * metrics["acc25"] + 0.75 * metrics["acc50"]
 
 
 def save_checkpoint(path: str, model: PCWNet, epoch: int, metrics: Dict[str, float]) -> None:
@@ -255,7 +271,7 @@ def main() -> None:
     print(json.dumps(vars(args), ensure_ascii=False, indent=2))
     print(f"device={device}")
     model = build_model(args).to(device)
-    criterion = Criterion(LossConfig()).to(device)
+    criterion = build_criterion(args).to(device)
     if args.eval:
         if not args.resume:
             raise ValueError("--eval requires --resume")

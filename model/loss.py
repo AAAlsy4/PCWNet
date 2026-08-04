@@ -16,8 +16,9 @@ class LossConfig:
     warp_weight: float = 2.0
     box_l1_weight: float = 2.0
     giou_weight: float = 2.0
-    certainty_weight: float = 0.25
-    selection_weight: float = 0.5
+    certainty_weight: float = 0.5
+    selection_weight: float = 1.0
+    selection_temperature: float = 0.1
     selected_box_weight: float = 1.0
     anchor_soft_weight: float = 0.5
     anchor_soft_sigma: float = 0.75
@@ -179,11 +180,15 @@ class Criterion(nn.Module):
         certainty_loss = F.binary_cross_entropy_with_logits(
             certainty_logits, candidate_ious.detach()
         )
-        selection_logits = (
-            outputs["candidate_anchor_scores"].clamp_min(1e-8).log()
-            + F.logsigmoid(certainty_logits)
+        selection_logits = outputs["candidate_selection_logits"]
+        selection_temperature = max(cfg.selection_temperature, 1e-6)
+        selection_target = F.softmax(
+            candidate_ious.detach() / selection_temperature,
+            dim=1,
         )
-        selection_loss = F.cross_entropy(selection_logits, best_index)
+        selection_loss = -(
+            selection_target * F.log_softmax(selection_logits, dim=1)
+        ).sum(dim=1).mean()
         selected_index = outputs["selected_indices"]
         selected_boxes = candidate_boxes[rows, selected_index]
         selected_box_l1_loss = F.l1_loss(selected_boxes, target_boxes)

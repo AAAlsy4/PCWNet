@@ -31,6 +31,7 @@ class PCWNetConfig:
     decoder_ffn_dim: int = 2048
     anchor_grid_size: Tuple[int, int] = (32, 32)
     topk: int = 5
+    anchor_score_power: float = 1.0
     local_softargmax_radius: int = 1
     refinement_levels: Tuple[str, ...] = ("layer3", "layer2", "layer1")
     refinement_dim: int = 256
@@ -368,7 +369,12 @@ class PCWNet(nn.Module):
             local_correlations.append(correlations)
 
         candidate_boxes = states_to_boxes(states)
-        candidate_scores = anchor_scores * torch.sigmoid(certainty_logits)
+        anchor_score_power = max(cfg.anchor_score_power, 0.0)
+        candidate_selection_logits = (
+            anchor_score_power * anchor_scores.clamp_min(1e-8).log()
+            + F.logsigmoid(certainty_logits)
+        )
+        candidate_scores = candidate_selection_logits.exp()
         selected_indices = candidate_scores.argmax(dim=1)
         batch_indices = torch.arange(batch, device=query_images.device)
         boxes = candidate_boxes[batch_indices, selected_indices]
@@ -388,6 +394,7 @@ class PCWNet(nn.Module):
             "local_correlations": local_correlations,
             "candidate_boxes": candidate_boxes,
             "candidate_certainty_logits": certainty_logits,
+            "candidate_selection_logits": candidate_selection_logits,
             "candidate_scores": candidate_scores,
             "selected_indices": selected_indices,
             "boxes": boxes,
