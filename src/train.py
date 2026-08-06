@@ -23,6 +23,7 @@ from utils.data_loader import RSDataset
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line options for training or evaluation."""
     parser = argparse.ArgumentParser(description="Train PCWNet")
     parser.add_argument("--data_root", default="./data")
     parser.add_argument("--data_name", default="CVOGL_DroneAerial")
@@ -39,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selection_weight", type=float, default=1.0)
     parser.add_argument("--selection_temperature", type=float, default=0.1)
     parser.add_argument("--anchor_score_power", type=float, default=1.0)
+    parser.add_argument("--reranker_weight", type=float, default=1.0)
     parser.add_argument("--no_pretrained_backbones", dest="pretrained_backbones", action="store_false")
     parser.add_argument("--train_coarse_backbone", dest="freeze_coarse", action="store_false")
     parser.set_defaults(pretrained_backbones=True, freeze_coarse=True)
@@ -53,12 +55,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_device(name: str) -> torch.device:
+    """Resolve an explicit device name or choose CUDA when available."""
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
 
 
 def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch random number generators."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -67,14 +71,21 @@ def set_seed(seed: int) -> None:
 
 
 def build_model(args: argparse.Namespace) -> PCWNet:
+    """Construct PCWNet and enable the reranker for SVI data."""
+    reranker = False
+    if args.data_name == "CVOGL_SVI":
+        reranker = True
     return PCWNet(PCWNetConfig(
         pretrained_backbones=args.pretrained_backbones,
         freeze_coarse=args.freeze_coarse and args.pretrained_backbones,
         anchor_score_power=args.anchor_score_power,
+        reranker=reranker,
+        reranker_weight=args.reranker_weight,
     ))
 
 
 def build_criterion(args: argparse.Namespace) -> Criterion:
+    """Construct the training criterion from command-line loss weights."""
     return Criterion(LossConfig(
         certainty_weight=args.certainty_weight,
         selection_weight=args.selection_weight,
@@ -83,6 +94,7 @@ def build_criterion(args: argparse.Namespace) -> Criterion:
 
 
 def build_optimizer(args: argparse.Namespace, model: PCWNet) -> torch.optim.Optimizer:
+    """Create AdamW parameter groups with a separate fine-backbone learning rate."""
     backbone_parameters = []
     head_parameters = []
     for name, parameter in model.named_parameters():
@@ -106,10 +118,12 @@ def build_optimizer(args: argparse.Namespace, model: PCWNet) -> torch.optim.Opti
 def build_scheduler(
     args: argparse.Namespace, optimizer: torch.optim.Optimizer
 ) -> torch.optim.lr_scheduler.LambdaLR:
+    """Create a linear-warmup and cosine-decay learning-rate scheduler."""
     warmup_epochs = min(max(args.warmup_epochs, 0), max(args.epochs - 1, 0))
     min_factor = min(max(args.min_lr / max(args.lr, 1e-12), 0.0), 1.0)
 
     def schedule(epoch: int) -> float:
+        """Return the multiplicative learning-rate factor for one epoch."""
         if warmup_epochs and epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
         decay_epochs = max(args.epochs - warmup_epochs - 1, 1)
@@ -121,7 +135,7 @@ def build_scheduler(
 
 
 def build_loader(args: argparse.Namespace, split: str, augment: bool) -> DataLoader:
-
+    """Build a dataset loader for the requested split and augmentation mode."""
     dataset = RSDataset(
         data_root=args.data_root,
         data_name=args.data_name,
@@ -141,17 +155,22 @@ def build_loader(args: argparse.Namespace, split: str, augment: bool) -> DataLoa
 
 
 class ImageNetTransform:
+    """Convert RGB uint8 images to ImageNet-normalized CHW tensors."""
+
     def __init__(self) -> None:
+        """Store ImageNet channel statistics as broadcastable tensors."""
         self.mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
         self.std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
     def __call__(self, image: np.ndarray) -> torch.Tensor:
+        """Normalize an ``[H, W, 3]`` RGB array into ``[3, H, W]``."""
         tensor = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1)
         tensor = tensor.float().div(255.0)
         return (tensor - self.mean) / self.std
 
 
 def move_batch(batch: Tuple[object, ...], device: torch.device):
+    """Move tensor fields of one dataset batch to the selected device."""
     query, reference, prompt, boxes, indices, classes = batch
     return (
         query.to(device, non_blocking=True),
@@ -172,6 +191,7 @@ def run_epoch(
     epoch: int,
     print_freq: int,
 ) -> Dict[str, float]:
+    """Run one training or evaluation epoch and aggregate localization metrics."""
     training = optimizer is not None
     model.train(training)
     totals = {
@@ -251,6 +271,7 @@ def checkpoint_score(metrics: Dict[str, float]) -> float:
 
 
 def save_checkpoint(path: str, model: PCWNet, epoch: int, metrics: Dict[str, float]) -> None:
+    """Persist model weights, epoch metadata, configuration, and metrics."""
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -259,12 +280,14 @@ def save_checkpoint(path: str, model: PCWNet, epoch: int, metrics: Dict[str, flo
 
 
 def load_checkpoint(path: str, model: torch.nn.Module) -> Dict[str, object]:
+    """Load a checkpoint into ``model`` and return its stored metadata."""
     checkpoint = torch.load(path, map_location="cpu")
     model.load_state_dict(checkpoint.get("state_dict", checkpoint))
     return checkpoint
 
 
 def main() -> None:
+    """Run the configured training loop or one evaluation pass."""
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)

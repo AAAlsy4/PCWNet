@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import os
 import sys
 import cv2
@@ -10,13 +8,19 @@ from torch.utils.data import Dataset
 import albumentations
 from shapely.geometry import Polygon
 
+
 cv2.setNumThreads(0)
+
     
 class DatasetNotFoundError(Exception):
-    pass
+    """Raised when a requested CVOGL dataset is not supported or unavailable."""
+
 
 class MyAugment:
+    """Apply lightweight image augmentation while updating one bounding box."""
+
     def __init__(self) -> None:
+        """Create the photometric augmentation pipeline."""
         self.transform = albumentations.Compose([
                 albumentations.Blur(p=0.01),
                 albumentations.MedianBlur(p=0.01),
@@ -24,6 +28,7 @@ class MyAugment:
                 albumentations.CLAHE(p=0.01)])
     
     def augment_hsv(self, im, hgain=0.5, sgain=0.5, vgain=0.5):
+        """Apply in-place random HSV gains to an RGB uint8 image."""
         # HSV color-space augmentation
         if hgain or sgain or vgain:
             r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
@@ -39,6 +44,7 @@ class MyAugment:
             cv2.cvtColor(im_hsv, cv2.COLOR_HSV2RGB, dst=im)  # no return needed
 
     def __call__(self, img, bbox):
+        """Augment an image and return it with its transformed XYXY box."""
         imgh,imgw, _ = img.shape
         x, y, w, h = (bbox[0]+bbox[2])/2/imgw, (bbox[1]+bbox[3])/2/imgh, (bbox[2]-bbox[0])/imgw, (bbox[3]-bbox[1])/imgh
         img = self.transform(image=img)['image']
@@ -99,8 +105,10 @@ class MyAugment:
         #print('---end---')
         return img, np.array(new_bbox, dtype=int)
 
+
 BOX_COLOR = (255, 0, 0) # Red
 TEXT_COLOR = (255, 255, 255) # White
+
 
 def visualize_bbox(img, bbox, color, thickness=2):
     """Visualizes a single bounding box on the image without displaying the class name"""
@@ -111,9 +119,13 @@ def visualize_bbox(img, bbox, color, thickness=2):
     
     return img
 
+
 class RSDataset(Dataset):
+    """Load query/reference image pairs and Gaussian click prompts for CVOGL."""
+
     def __init__(self, data_root, data_name='CVOGL', split_name='train', img_size=1024,
                  transform=None, augment=False):
+        """Load split metadata and configure dataset-specific transforms."""
         self.data_root = data_root
         self.data_name = data_name
         self.img_size = img_size
@@ -169,9 +181,11 @@ class RSDataset(Dataset):
         ])
 
     def __len__(self):
+        """Return the number of query/reference pairs in the split."""
         return len(self.data_list)
     
     def __getitem__(self, idx):
+        """Load one pair, normalize its box, and generate a Gaussian click map."""
         _, queryimg_name, rsimg_name, _, click_xy, bbox, _, cls_name = self.data_list[idx]
         
         ## box format: to x1y1x2y2

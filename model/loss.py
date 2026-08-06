@@ -107,6 +107,7 @@ class Criterion(nn.Module):
     """Combine coarse matching, box refinement, and candidate ranking losses."""
 
     def __init__(self, config: Optional[LossConfig] = None) -> None:
+        """Initialize the loss configuration used for all supervision terms."""
         super().__init__()
         self.config = config or LossConfig()
 

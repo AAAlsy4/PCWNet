@@ -14,6 +14,7 @@ from utils.data_loader import RSDataset
 
 
 def parse_args():
+    """Parse command-line options for the visualization demo."""
     parser=argparse.ArgumentParser("PCWNet visualization demo")
     parser.add_argument("--data_root", default="./data")
     parser.add_argument("--data_name", default="CVOGL_DroneAerial")
@@ -21,19 +22,24 @@ def parse_args():
     parser.add_argument("--index", type=int, default=0, help="image pair index")
     parser.add_argument("--checkpoint", default="saved_models/PCWNet_best.pth")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--save_dir", default="visualization")
+    parser.add_argument("--save_dir", default="vis")
+    parser.add_argument("--anchor_score_power", type=float, default=1.0)
+    parser.add_argument("--reranker_weight", type=float, default=1.0)
 
     return parser.parse_args()
 
 
 class ImageNetTransform:
+    """Convert images to ImageNet-normalized tensors and restore them for display."""
 
     def __init__(self):
+        """Store ImageNet normalization statistics."""
 
         self.mean=torch.tensor([0.485,0.456,0.406])[:,None,None]
         self.std=torch.tensor([0.229,0.224,0.225])[:,None,None]
 
     def __call__(self, image):
+        """Normalize an RGB image array and return a channel-first tensor."""
 
         tensor=torch.from_numpy(np.ascontiguousarray(image)).permute(2,0,1)
         tensor=tensor.float().div(255.0)
@@ -49,11 +55,13 @@ class ImageNetTransform:
 
 
 def save_img(path,img):
+    """Convert an RGB image to BGR and write it to disk."""
     img=cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite(path,img)
 
 
 def draw_box(img, box, color, text=""):
+    """Draw a normalized XYXY box and optional label on an image copy."""
     out=img.copy()
     h,w,_=out.shape
     x1,y1,x2,y2=box
@@ -83,6 +91,7 @@ def vis_prompt(query_img, prompt_map, save):
 
 
 def vis_heatmap(sat, logits, save):
+    """Overlay normalized anchor logits on the reference image."""
     heatmap=logits.cpu().numpy()
     heatmap=np.exp(heatmap-heatmap.max())
     heatmap/=heatmap.max()
@@ -96,6 +105,7 @@ def vis_heatmap(sat, logits, save):
 
 
 def vis_candidates(sat, outputs, save):
+    """Draw all candidate boxes with their fused scores."""
     img=sat.copy()
     boxes=outputs["candidate_boxes"][0].cpu().numpy()
     scores=outputs["candidate_scores"][0].cpu().numpy()
@@ -107,6 +117,7 @@ def vis_candidates(sat, outputs, save):
 
 
 def state_to_box(state):
+    """Convert batched center/log-size states to XYXY boxes."""
     center=state[:,:,:2]
     size=torch.exp(state[:,:,2:])
 
@@ -114,6 +125,7 @@ def state_to_box(state):
 
 
 def vis_refinement(sat, outputs, save_dir):
+    """Save the candidate box trajectory after each refinement level."""
     colors=[(0,0,255), (0,255,255), (255,165,0), (0,255,0)]
     names=["init","layer3","layer2","layer1"]
     trajectory=sat.copy()
@@ -127,6 +139,7 @@ def vis_refinement(sat, outputs, save_dir):
 
 
 def vis_final(sat, outputs, save):
+    """Draw and save the selected final prediction."""
     box=outputs["boxes"][0].cpu().numpy()
     score=float(outputs["scores"][0])
     img=draw_box(sat, box, (0,255,0), f"FINAL:{score:.3f}")
@@ -134,7 +147,11 @@ def vis_final(sat, outputs, save):
 
 
 def main():
+    """Load one dataset pair, run PCWNet, and save diagnostic visualizations."""
     args=parse_args()
+    reranker = False
+    if args.data_name == "CVOGL_SVI":
+        reranker = True
     os.makedirs(args.save_dir,exist_ok=True)
     device=torch.device(args.device)
 
@@ -156,7 +173,11 @@ def main():
     query_vis=transform.denormalize(query[0].cpu()).permute(1,2,0).numpy()
     reference_vis=transform.denormalize(reference[0].cpu()).permute(1,2,0).numpy()
 
-    model=PCWNet(PCWNetConfig())
+    model=PCWNet(PCWNetConfig(
+        anchor_score_power=args.anchor_score_power,
+        reranker=reranker,
+        reranker_weight=args.reranker_weight,
+    ))
     ckpt=torch.load(args.checkpoint,map_location="cpu")
     model.load_state_dict(ckpt["state_dict"])
     model.to(device)
