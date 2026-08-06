@@ -316,7 +316,7 @@ def main() -> None:
         val_metrics["selection_score"] = score
         current_lr = max(group["lr"] for group in optimizer.param_groups)
         print(
-            f"epoch={epoch} train={train_metrics} val={val_metrics} "
+            f"epoch={epoch}\ntrain={train_metrics}\nval={val_metrics}\n"
             f"lr={current_lr:.6g}",
             flush=True,
         )

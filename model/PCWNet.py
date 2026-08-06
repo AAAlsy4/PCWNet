@@ -420,9 +420,6 @@ class CrossViewReranker(nn.Module):
         return self.score_head(features).squeeze(-1)  # [B, K]
 
 
-
-
-
 class PCWNet(nn.Module):
     """Probabilistic coarse-to-fine warp network for cross-view localization."""
 
