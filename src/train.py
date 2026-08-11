@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--backbone_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--warmup_epochs", type=int, default=2)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--certainty_weight", type=float, default=0.5)
@@ -78,6 +79,7 @@ def build_model(args: argparse.Namespace) -> PCWNet:
     return PCWNet(PCWNetConfig(
         pretrained_backbones=args.pretrained_backbones,
         freeze_coarse=args.freeze_coarse and args.pretrained_backbones,
+        topk=args.topk,
         anchor_score_power=args.anchor_score_power,
         reranker=reranker,
         reranker_weight=args.reranker_weight,
@@ -241,7 +243,7 @@ def run_epoch(
         if batch_index % max(print_freq, 1) == 0:
             mode = "train" if training else "eval"
             print(
-                f"[{mode}] epoch={epoch} batch={batch_index}/{len(loader)} "
+                f"[{mode}] epoch={epoch + 1} batch={batch_index}/{len(loader)} "
                 f"loss={float(losses['loss'].detach()):.4f} "
                 f"iou={float(ious.mean()):.4f} "
                 f"acc50={float((ious >= 0.50).float().mean()):.4f} "
@@ -299,7 +301,7 @@ def main() -> None:
         if not args.resume:
             raise ValueError("--eval requires --resume")
         checkpoint = load_checkpoint(args.resume, model)
-        print(f"loaded checkpoint epoch={checkpoint.get('epoch', 'unknown')}")
+        print("loaded checkpoint")
         metrics = run_epoch(model, criterion, build_loader(args, args.split, False), None, device, 0, args.print_freq)
         print(json.dumps(metrics, indent=2))
         return
@@ -316,7 +318,7 @@ def main() -> None:
         val_metrics["selection_score"] = score
         current_lr = max(group["lr"] for group in optimizer.param_groups)
         print(
-            f"epoch={epoch}\ntrain={train_metrics}\nval={val_metrics}\n"
+            f"epoch={epoch + 1}\ntrain={train_metrics}\nval={val_metrics}\n"
             f"lr={current_lr:.6g}",
             flush=True,
         )
