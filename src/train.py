@@ -13,12 +13,12 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from model.loss import Criterion, LossConfig, aligned_iou, normalize_xyxy_boxes
-from model.PCWNet import PCWNetConfig, PCWNet
+from model.PCWNet import PCWNetConfig, PCWNet, query_patch_scales_for_dataset
 from utils.data_loader import RSDataset
 
 
@@ -27,24 +27,43 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PCWNet")
     parser.add_argument("--data_root", default="./data")
     parser.add_argument("--data_name", default="CVOGL_DroneAerial")
-    parser.add_argument("--img_size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=12)
-    parser.add_argument("--num_workers", type=int, default=24)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--backbone_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
-    parser.add_argument("--topk", type=int, default=5)
+    parser.add_argument("--topk", type=int, default=7)
     parser.add_argument("--warmup_epochs", type=int, default=2)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument("--certainty_weight", type=float, default=0.5)
+    parser.add_argument(
+        "--finetune_epochs",
+        type=int,
+        default=5,
+        help="epochs to fine-tune on train+val after model selection; 0 disables it",
+    )
+    parser.add_argument(
+        "--finetune_lr",
+        type=float,
+        default=None,
+        help="train+val fine-tuning learning rate (default: 0.1 * --lr)",
+    )
+    parser.add_argument("--certainty_weight", type=float, default=1.0)
     parser.add_argument("--selection_weight", type=float, default=1.0)
     parser.add_argument("--selection_temperature", type=float, default=0.1)
-    parser.add_argument("--anchor_score_power", type=float, default=1.0)
+    parser.add_argument("--ranking_weight", type=float, default=1.0)
+    parser.add_argument("--ranking_margin_scale", type=float, default=1.0)
+    parser.add_argument("--anchor_score_power", type=float, default=0.5)
     parser.add_argument("--reranker_weight", type=float, default=1.0)
+    parser.add_argument("--no_reranker", dest="reranker", action="store_false")
+    parser.add_argument("--candidate_nms_iou", type=float, default=0.7)
     parser.add_argument("--no_pretrained_backbones", dest="pretrained_backbones", action="store_false")
     parser.add_argument("--train_coarse_backbone", dest="freeze_coarse", action="store_false")
-    parser.set_defaults(pretrained_backbones=True, freeze_coarse=True)
+    parser.set_defaults(
+        pretrained_backbones=True,
+        freeze_coarse=True,
+        reranker=True,
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--checkpoint", default="saved_models/PCWNet_best.pth")
@@ -71,18 +90,31 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    """Reject invalid training schedules before allocating model resources."""
+    if args.eval:
+        return
+    if args.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
+    if args.finetune_epochs < 0:
+        raise ValueError("--finetune_epochs cannot be negative")
+    if args.lr <= 0 or args.backbone_lr <= 0 or args.min_lr < 0:
+        raise ValueError("learning rates must be positive (--min_lr may be zero)")
+    if args.finetune_lr is not None and args.finetune_lr <= 0:
+        raise ValueError("--finetune_lr must be positive")
+
+
 def build_model(args: argparse.Namespace) -> PCWNet:
-    """Construct PCWNet and enable the reranker for SVI data."""
-    reranker = False
-    if args.data_name == "CVOGL_SVI":
-        reranker = True
+    """Construct PCWNet with candidate reranking enabled for all datasets."""
     return PCWNet(PCWNetConfig(
         pretrained_backbones=args.pretrained_backbones,
         freeze_coarse=args.freeze_coarse and args.pretrained_backbones,
         topk=args.topk,
         anchor_score_power=args.anchor_score_power,
-        reranker=reranker,
+        reranker=args.reranker,
         reranker_weight=args.reranker_weight,
+        query_patch_scales=query_patch_scales_for_dataset(args.data_name),
+        candidate_nms_iou=args.candidate_nms_iou,
     ))
 
 
@@ -92,11 +124,20 @@ def build_criterion(args: argparse.Namespace) -> Criterion:
         certainty_weight=args.certainty_weight,
         selection_weight=args.selection_weight,
         selection_temperature=args.selection_temperature,
+        ranking_weight=args.ranking_weight,
+        ranking_margin_scale=args.ranking_margin_scale,
     ))
 
 
-def build_optimizer(args: argparse.Namespace, model: PCWNet) -> torch.optim.Optimizer:
+def build_optimizer(
+    args: argparse.Namespace,
+    model: PCWNet,
+    lr: float | None = None,
+    backbone_lr: float | None = None,
+) -> torch.optim.Optimizer:
     """Create AdamW parameter groups with a separate fine-backbone learning rate."""
+    head_lr = args.lr if lr is None else lr
+    fine_backbone_lr = args.backbone_lr if backbone_lr is None else backbone_lr
     backbone_parameters = []
     head_parameters = []
     for name, parameter in model.named_parameters():
@@ -107,53 +148,85 @@ def build_optimizer(args: argparse.Namespace, model: PCWNet) -> torch.optim.Opti
         else:
             head_parameters.append(parameter)
 
-    parameter_groups = [{"params": head_parameters, "lr": args.lr}]
+    parameter_groups = [{"params": head_parameters, "lr": head_lr}]
     if backbone_parameters:
-        parameter_groups.append({"params": backbone_parameters, "lr": args.backbone_lr})
+        parameter_groups.append(
+            {"params": backbone_parameters, "lr": fine_backbone_lr}
+        )
     return torch.optim.AdamW(
         parameter_groups,
-        lr=args.lr,
+        lr=head_lr,
         weight_decay=args.weight_decay,
     )
 
 
 def build_scheduler(
-    args: argparse.Namespace, optimizer: torch.optim.Optimizer
+    args: argparse.Namespace,
+    optimizer: torch.optim.Optimizer,
+    epochs: int | None = None,
+    lr: float | None = None,
+    warmup_epochs: int | None = None,
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """Create a linear-warmup and cosine-decay learning-rate scheduler."""
-    warmup_epochs = min(max(args.warmup_epochs, 0), max(args.epochs - 1, 0))
-    min_factor = min(max(args.min_lr / max(args.lr, 1e-12), 0.0), 1.0)
+    total_epochs = args.epochs if epochs is None else epochs
+    base_lr = args.lr if lr is None else lr
+    warmup = args.warmup_epochs if warmup_epochs is None else warmup_epochs
+    warmup = min(max(warmup, 0), max(total_epochs - 1, 0))
+    min_factor = min(max(args.min_lr / max(base_lr, 1e-12), 0.0), 1.0)
 
     def schedule(epoch: int) -> float:
         """Return the multiplicative learning-rate factor for one epoch."""
-        if warmup_epochs and epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        decay_epochs = max(args.epochs - warmup_epochs - 1, 1)
-        progress = min(max((epoch - warmup_epochs) / decay_epochs, 0.0), 1.0)
+        if warmup and epoch < warmup:
+            return (epoch + 1) / warmup
+        decay_epochs = max(total_epochs - warmup - 1, 1)
+        progress = min(max((epoch - warmup) / decay_epochs, 0.0), 1.0)
         cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
         return min_factor + (1.0 - min_factor) * float(cosine)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
 
-def build_loader(args: argparse.Namespace, split: str, augment: bool) -> DataLoader:
-    """Build a dataset loader for the requested split and augmentation mode."""
-    dataset = RSDataset(
+def build_dataset(args: argparse.Namespace, split: str, augment: bool) -> RSDataset:
+    """Build one dataset split with the requested augmentation mode."""
+    return RSDataset(
         data_root=args.data_root,
         data_name=args.data_name,
         split_name=split,
-        img_size=args.img_size,
         transform=ImageNetTransform(),
         augment=augment,
     )
+
+
+def build_data_loader(
+    args: argparse.Namespace, dataset: Dataset, shuffle: bool
+) -> DataLoader:
+    """Wrap a dataset in the common loader configuration."""
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=augment,
+        shuffle=shuffle,
         drop_last=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
+
+
+def build_loader(args: argparse.Namespace, split: str, augment: bool) -> DataLoader:
+    """Build a dataset loader for the requested split and augmentation mode."""
+    return build_data_loader(
+        args, build_dataset(args, split, augment), shuffle=augment
+    )
+
+
+def build_train_val_loader(args: argparse.Namespace) -> DataLoader:
+    """Build one shuffled training loader containing train and val samples."""
+    dataset = ConcatDataset(
+        [
+            build_dataset(args, "train", augment=True),
+            build_dataset(args, "val", augment=True),
+        ]
+    )
+    return build_data_loader(args, dataset, shuffle=True)
 
 
 class ImageNetTransform:
@@ -272,13 +345,26 @@ def checkpoint_score(metrics: Dict[str, float]) -> float:
     return 0.25 * metrics["acc25"] + 0.75 * metrics["acc50"]
 
 
-def save_checkpoint(path: str, model: PCWNet, epoch: int, metrics: Dict[str, float]) -> None:
+def save_checkpoint(
+    path: str,
+    model: PCWNet,
+    epoch: int,
+    metrics: Dict[str, float],
+    training_state: Dict[str, object] | None = None,
+) -> None:
     """Persist model weights, epoch metadata, configuration, and metrics."""
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    torch.save({"epoch": epoch, "state_dict": model.state_dict(),
-                "metrics": metrics, "config": asdict(model.config)}, path)
+    checkpoint = {
+        "epoch": epoch,
+        "state_dict": model.state_dict(),
+        "metrics": metrics,
+        "config": asdict(model.config),
+    }
+    if training_state is not None:
+        checkpoint["training_state"] = training_state
+    torch.save(checkpoint, path)
 
 
 def load_checkpoint(path: str, model: torch.nn.Module) -> Dict[str, object]:
@@ -288,9 +374,82 @@ def load_checkpoint(path: str, model: torch.nn.Module) -> Dict[str, object]:
     return checkpoint
 
 
+def finetune_on_train_val(
+    args: argparse.Namespace,
+    model: PCWNet,
+    criterion: Criterion,
+    device: torch.device,
+) -> None:
+    """Fine-tune the best validation model on the combined train+val data."""
+    if args.finetune_epochs == 0:
+        print("train+val fine-tuning disabled", flush=True)
+        return
+
+    source = load_checkpoint(args.checkpoint, model)
+    source_epoch = int(source.get("epoch", -1))
+    source_metrics = source.get("metrics", {})
+    finetune_lr = args.finetune_lr
+    if finetune_lr is None:
+        finetune_lr = args.lr * 0.1
+    finetune_backbone_lr = args.backbone_lr * (finetune_lr / args.lr)
+
+    optimizer = build_optimizer(
+        args,
+        model,
+        lr=finetune_lr,
+        backbone_lr=finetune_backbone_lr,
+    )
+    scheduler = build_scheduler(
+        args,
+        optimizer,
+        epochs=args.finetune_epochs,
+        lr=finetune_lr,
+        warmup_epochs=0,
+    )
+    loader = build_train_val_loader(args)
+    print(f"loaded best checkpoint {args.checkpoint}", flush=True)
+
+    for finetune_epoch in range(args.finetune_epochs):
+        metrics = run_epoch(
+            model,
+            criterion,
+            loader,
+            optimizer,
+            device,
+            finetune_epoch,
+            args.print_freq,
+        )
+        current_lr = max(group["lr"] for group in optimizer.param_groups)
+        print(
+            f"finetune_epoch={finetune_epoch + 1}\n"
+            f"train+val={metrics}\nlr={current_lr:.6g}",
+            flush=True,
+        )
+        scheduler.step()
+        base, ext = os.path.splitext(args.checkpoint)
+        fine_checkpoint = f"{base}_fine_{finetune_epoch + 1}{ext}"
+        save_checkpoint(
+            fine_checkpoint,
+            model,
+            args.epochs + finetune_epoch,
+            metrics,
+            training_state={
+                "stage": "train_val_finetune",
+                "source_checkpoint": args.checkpoint,
+                "source_epoch": source_epoch,
+                "source_metrics": source_metrics,
+                "finetune_epoch": finetune_epoch,
+                "finetune_epochs": args.finetune_epochs,
+                "learning_rate": current_lr,
+            },
+        )
+        print(f"saved {fine_checkpoint}", flush=True)
+
+
 def main() -> None:
     """Run the configured training loop or one evaluation pass."""
     args = parse_args()
+    validate_args(args)
     set_seed(args.seed)
     device = resolve_device(args.device)
     print(json.dumps(vars(args), ensure_ascii=False, indent=2))
@@ -302,7 +461,10 @@ def main() -> None:
             raise ValueError("--eval requires --resume")
         checkpoint = load_checkpoint(args.resume, model)
         print("loaded checkpoint")
-        metrics = run_epoch(model, criterion, build_loader(args, args.split, False), None, device, 0, args.print_freq)
+        metrics = run_epoch(
+            model, criterion, build_loader(args, args.split, False), None, device, 0,
+            args.print_freq,
+        )
         print(json.dumps(metrics, indent=2))
         return
 
@@ -311,9 +473,14 @@ def main() -> None:
     train_loader = build_loader(args, "train", True)
     val_loader = build_loader(args, "val", False)
     best_score = float("-inf")
+    best_epoch = -1
     for epoch in range(args.epochs):
-        train_metrics = run_epoch(model, criterion, train_loader, optimizer, device, epoch, args.print_freq)
-        val_metrics = run_epoch(model, criterion, val_loader, None, device, epoch, args.print_freq)
+        train_metrics = run_epoch(
+            model, criterion, train_loader, optimizer, device, epoch, args.print_freq,
+        )
+        val_metrics = run_epoch(
+            model, criterion, val_loader, None, device, epoch, args.print_freq,
+        )
         score = checkpoint_score(val_metrics)
         val_metrics["selection_score"] = score
         current_lr = max(group["lr"] for group in optimizer.param_groups)
@@ -323,11 +490,23 @@ def main() -> None:
             flush=True,
         )
         scheduler.step()
-        if score > best_score:
+        if best_epoch < 0 or (
+            np.isfinite(score)
+            and (not np.isfinite(best_score) or score > best_score)
+        ):
             best_score = score
+            best_epoch = epoch
             save_checkpoint(args.checkpoint, model, epoch, val_metrics)
             print(f"saved {args.checkpoint}", flush=True)
+
+    print(
+        f"best validation checkpoint: epoch={best_epoch + 1} "
+        f"score={best_score:.6f}",
+        flush=True,
+    )
+    finetune_on_train_val(args, model, criterion, device)
 
 
 if __name__ == "__main__":
     main()
+

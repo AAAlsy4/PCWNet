@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from model.PCWNet import PCWNet, PCWNetConfig
+from model.PCWNet import PCWNet, PCWNetConfig, query_patch_scales_for_dataset
 from utils.data_loader import RSDataset
 
 
@@ -39,8 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_dir", default="vis")
     parser.add_argument("--topk", type=positive_int, default=5,
         help="number of candidate boxes to refine")
-    parser.add_argument("--anchor_score_power", type=float, default=1.0)
+    parser.add_argument("--anchor_score_power", type=float, default=0.5)
     parser.add_argument("--reranker_weight", type=float, default=1.0)
+    parser.add_argument("--candidate_nms_iou", type=float, default=0.7)
 
     return parser.parse_args()
 
@@ -276,7 +277,10 @@ def main() -> None:
     model=PCWNet(PCWNetConfig(
         topk=args.topk,
         anchor_score_power=args.anchor_score_power,
+        reranker=True,
         reranker_weight=args.reranker_weight,
+        query_patch_scales=query_patch_scales_for_dataset(args.data_name),
+        candidate_nms_iou=args.candidate_nms_iou,
     ))
     ckpt=torch.load(args.checkpoint,map_location="cpu")
     model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -313,3 +317,4 @@ def main() -> None:
 
 if __name__=="__main__":
     main()
+

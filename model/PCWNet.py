@@ -31,20 +31,36 @@ class PCWNetConfig:
     decoder_ffn_dim: int = 2048
     anchor_grid_size: Tuple[int, int] = (32, 32)
     topk: int = 5
-    anchor_score_power: float = 1.0
-    reranker: bool = False
+    anchor_score_power: float = 0.5
+    reranker: bool = True
     reranker_weight: float = 1.0
     reranker_dim: int = 128
     reranker_heads: int = 4
     reranker_layers: int = 2
     reranker_patch_size: int = 7
     query_patch_scale: float = 0.25
+    # Each tuple is (normalized width, normalized height) for a query patch.
+    query_patch_scales: Tuple[Tuple[float, float], ...] = ((0.25, 0.25),)
+    candidate_nms_iou: float = 0.7
     local_softargmax_radius: int = 1
     refinement_levels: Tuple[str, ...] = ("layer3", "layer2", "layer1")
     refinement_dim: int = 256
     refinement_patch_size: int = 7
     min_box_size: float = 1.0 / 1024.0
     max_box_size: float = 1.0
+
+
+def query_patch_scales_for_dataset(
+    data_name: str,
+) -> Tuple[Tuple[float, float], ...]:
+    """Return view-aware query windows for the reranker.
+
+    SVI queries are 2:1 wide images, so Ground uses anisotropic context at
+    multiple scales. Drone queries remain square and use the original window.
+    """
+    if data_name == "CVOGL_SVI":
+        return ((0.25, 0.25), (0.50, 0.30), (0.75, 0.40))
+    return ((0.25, 0.25),)
 
 
 class CoarseSemanticEncoder(nn.Module):
@@ -194,8 +210,8 @@ class ObjectWarpRefiner(nn.Module):
         certainty_logits: torch.Tensor,
         min_box_size: float,
         max_box_size: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Refine candidate box states and return states, certainty, and correlation."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Refine candidates and return states, certainty, correlation, and hidden state."""
         patches = sample_candidate_patches(
             reference_feature, states, self.patch_size
         )  # [B, K, C, S, S]
@@ -237,11 +253,11 @@ class ObjectWarpRefiner(nn.Module):
         )  # [B, K, 2]
         new_states = torch.cat((centers, log_sizes), dim=-1)  # [B, K, 4]
         new_certainty = certainty_logits + self.certainty_head(hidden).squeeze(-1)  # [B, K]
-        return new_states, new_certainty, correlations
+        return new_states, new_certainty, correlations, hidden
 
 
 class CrossViewReranker(nn.Module):
-    """Rerank SVI candidates using prompt-local cross-view patch attention."""
+    """Rerank candidates using prompt-local attention and refinement history."""
 
     def __init__(
         self,
@@ -253,6 +269,9 @@ class CrossViewReranker(nn.Module):
         layers: int,
         patch_size: int,
         query_patch_scale: float,
+        refinement_dim: int,
+        refinement_level_count: int,
+        query_patch_scales: Optional[Tuple[Tuple[float, float], ...]] = None,
     ) -> None:
         """Build the multi-scale cross-attention candidate reranker."""
         super().__init__()
@@ -263,6 +282,17 @@ class CrossViewReranker(nn.Module):
         self.levels = tuple(levels)
         self.patch_size = patch_size
         self.query_patch_scale = max(query_patch_scale, 1e-4)
+        raw_scales = query_patch_scales or (
+            (self.query_patch_scale, self.query_patch_scale),
+        )
+        normalized_scales = []
+        for scale in raw_scales:
+            if len(scale) != 2 or min(scale) <= 0:
+                raise ValueError("query patch scales must be positive (width, height) pairs")
+            normalized_scales.append((float(scale[0]), float(scale[1])))
+        if not normalized_scales:
+            raise ValueError("at least one query patch scale is required")
+        self.query_patch_scales = tuple(normalized_scales)
         # Per-view projections into the shared attention space.
         self.query_proj = nn.ModuleDict(
             {
@@ -308,7 +338,22 @@ class CrossViewReranker(nn.Module):
                 for level in self.levels
             }
         )
-        feature_dim = len(self.levels) * hidden_dim * 2 + 6
+        self.refinement_proj = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(refinement_dim, hidden_dim), nn.GELU())
+                for _ in range(refinement_level_count)
+            ]
+        )
+        self.metadata_proj = nn.Sequential(
+            nn.Linear(6, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        feature_dim = (
+            len(self.levels) * hidden_dim * 2
+            + refinement_level_count * hidden_dim
+            + hidden_dim
+        )
         # Residual candidate ranking head.
         self.score_head = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
@@ -316,15 +361,15 @@ class CrossViewReranker(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, 1),
         )
-        # Start as an exact residual no-op and let selection supervision learn the reranking.
-        nn.init.zeros_(self.score_head[-1].weight)
+        # Start near a residual no-op while preserving first-step gradients upstream.
+        nn.init.normal_(self.score_head[-1].weight, std=1e-3)
         nn.init.zeros_(self.score_head[-1].bias)
 
     @staticmethod
     def _prompt_states(
         prompt_map: torch.Tensor,
         feature: torch.Tensor,
-        patch_scale: float,
+        patch_scale: float | Tuple[float, float],
     ) -> torch.Tensor:
         """Convert a prompt map into one normalized query patch state per image."""
         if prompt_map.ndim == 3:
@@ -342,7 +387,11 @@ class CrossViewReranker(nn.Module):
         center_x = (weights[:, 0] * x_coords.view(1, 1, -1)).sum(dim=(-2, -1))  # [B]
         center_y = (weights[:, 0] * y_coords.view(1, -1, 1)).sum(dim=(-2, -1))  # [B]
         centers = torch.stack((center_x, center_y), dim=-1)  # [B, 2]
-        sizes = centers.new_full((centers.shape[0], 2), patch_scale)  # [B, 2]
+        if isinstance(patch_scale, (float, int)):
+            patch_scale = (float(patch_scale), float(patch_scale))
+        sizes = centers.new_tensor(patch_scale).view(1, 2).expand(
+            centers.shape[0], -1
+        )  # [B, 2]
         return torch.cat((centers, sizes.log()), dim=-1).unsqueeze(1)  # [B, 1, 4]
 
     def forward(
@@ -353,27 +402,19 @@ class CrossViewReranker(nn.Module):
         states: torch.Tensor,
         anchor_scores: torch.Tensor,
         certainty_logits: torch.Tensor,
+        refinement_hidden_states: List[torch.Tensor],
     ) -> torch.Tensor:
         """Return one residual ranking logit for each existing candidate."""
-        query_states = self._prompt_states(
-            prompt_map,
-            query_features[self.levels[0]],
-            self.query_patch_scale,
-        )  # [B, 1, 4]
         detached_states = states.detach()  # [B, K, 4]
         batch, candidate_count = states.shape[:2]
         level_features = []
         for level in self.levels:
             query_feature = query_features[level].detach()  # [B, Cq, Hq, Wq]
             reference_feature = reference_features[level].detach()  # [B, Cr, Hr, Wr]
-            query_patch = sample_candidate_patches(
-                query_feature, query_states, self.patch_size
-            )[:, 0]  # [B, Cq, S, S]
             reference_patches = sample_candidate_patches(
                 reference_feature, detached_states, self.patch_size
             )  # [B, K, Cr, S, S]
             _, _, channels, patch_height, patch_width = reference_patches.shape
-            query_tokens = self.query_proj[level](query_patch).flatten(2).transpose(1, 2)  # [B, S^2, D]
             reference_tokens = self.reference_proj[level](
                 reference_patches.reshape(
                     batch * candidate_count,
@@ -382,49 +423,103 @@ class CrossViewReranker(nn.Module):
                     patch_width,
                 )
             ).flatten(2).transpose(1, 2)  # [B*K, S^2, D]
-            query_tokens = self.query_norm[level](query_tokens)  # [B, S^2, D]
             reference_tokens = self.reference_norm[level](reference_tokens)  # [B*K, S^2, D]
-            query_tokens = query_tokens[:, None].expand(
-                -1, candidate_count, -1, -1
-            ).reshape(batch * candidate_count, query_tokens.shape[1], -1)  # [B*K, S^2, D]
-            attended = query_tokens  # [B*K, S^2, D]
-            for attention, norm in zip(
-                self.cross_attention[level], self.cross_norm[level]
-            ):
-                residual = attended  # [B*K, S^2, D]
-                attended, _ = attention(
-                    attended,
-                    reference_tokens,
-                    reference_tokens,
-                    need_weights=False,
-                )  # [B*K, S^2, D]
-                attended = norm(attended + residual)  # [B*K, S^2, D]
-            attended_pool = attended.mean(dim=1)  # [B*K, D]
-            query_pool = query_tokens.mean(dim=1)  # [B*K, D]
             reference_pool = reference_tokens.mean(dim=1)  # [B*K, D]
-            interaction = query_pool * reference_pool  # [B*K, D]
-            level_features.append(
-                torch.cat((attended_pool, interaction), dim=-1).view(
-                    batch, candidate_count, -1
+            scale_features = []
+            for patch_scale in self.query_patch_scales:
+                query_states = self._prompt_states(
+                    prompt_map,
+                    query_features[self.levels[0]],
+                    patch_scale,
+                )  # [B, 1, 4]
+                query_patch = sample_candidate_patches(
+                    query_feature, query_states, self.patch_size
+                )[:, 0]  # [B, Cq, S, S]
+                query_tokens = self.query_proj[level](query_patch).flatten(2).transpose(1, 2)  # [B, S^2, D]
+                query_tokens = self.query_norm[level](query_tokens)  # [B, S^2, D]
+                query_tokens = query_tokens[:, None].expand(
+                    -1, candidate_count, -1, -1
+                ).reshape(batch * candidate_count, query_tokens.shape[1], -1)  # [B*K, S^2, D]
+                attended = query_tokens  # [B*K, S^2, D]
+                for attention, norm in zip(
+                    self.cross_attention[level], self.cross_norm[level]
+                ):
+                    residual = attended  # [B*K, S^2, D]
+                    attended, _ = attention(
+                        attended,
+                        reference_tokens,
+                        reference_tokens,
+                        need_weights=False,
+                    )  # [B*K, S^2, D]
+                    attended = norm(attended + residual)  # [B*K, S^2, D]
+                attended_pool = attended.mean(dim=1)  # [B*K, D]
+                query_pool = query_tokens.mean(dim=1)  # [B*K, D]
+                interaction = query_pool * reference_pool  # [B*K, D]
+                scale_features.append(
+                    torch.cat((attended_pool, interaction), dim=-1).view(
+                        batch, candidate_count, -1
+                    )
                 )
-            )  # Each element is [B, K, 2D]
+            level_features.append(torch.stack(scale_features, dim=0).mean(dim=0))
+        if len(refinement_hidden_states) != len(self.refinement_proj):
+            raise ValueError("Reranker hidden-state count must match refinement levels")
+        hidden_features = [
+            projection(hidden)
+            for projection, hidden in zip(
+                self.refinement_proj, refinement_hidden_states
+            )
+        ]
         metadata = torch.cat(
             (
                 detached_states,
-                anchor_scores.detach().clamp_min(1e-8).log().unsqueeze(-1),
-                certainty_logits.detach().unsqueeze(-1),
+                anchor_scores.clamp_min(1e-8).log().unsqueeze(-1),
+                certainty_logits.unsqueeze(-1),
             ),
             dim=-1,
         )  # [B, K, 6]
-        features = torch.cat((*level_features, metadata), dim=-1)  # [B, K, 2DL+6]
+        metadata_features = self.metadata_proj(metadata)  # [B, K, D]
+        features = torch.cat(
+            (*level_features, *hidden_features, metadata_features), dim=-1
+        )
         return self.score_head(features).squeeze(-1)  # [B, K]
+
+
+def candidate_nms_mask(
+    boxes: torch.Tensor, logits: torch.Tensor, iou_threshold: float
+) -> torch.Tensor:
+    """Suppress lower-scoring duplicate boxes while preserving fixed K tensors."""
+    batch = logits.shape[0]
+    keep_mask = torch.zeros_like(logits, dtype=torch.bool)
+    threshold = min(max(iou_threshold, 0.0), 1.0)
+    for batch_index in range(batch):
+        order = logits[batch_index].detach().argsort(descending=True)
+        while order.numel() > 0:
+            current = order[0]
+            keep_mask[batch_index, current] = True
+            if order.numel() == 1:
+                break
+            remaining = order[1:]
+            current_box = boxes[batch_index, current]
+            remaining_boxes = boxes[batch_index, remaining]
+            top_left = torch.maximum(current_box[:2], remaining_boxes[:, :2])
+            bottom_right = torch.minimum(current_box[2:], remaining_boxes[:, 2:])
+            intersection = (bottom_right - top_left).clamp_min(0).prod(dim=-1)
+            current_area = (current_box[2:] - current_box[:2]).clamp_min(0).prod()
+            remaining_area = (
+                remaining_boxes[:, 2:] - remaining_boxes[:, :2]
+            ).clamp_min(0).prod(dim=-1)
+            iou = intersection / (
+                current_area + remaining_area - intersection
+            ).clamp_min(1e-7)
+            order = remaining[iou <= threshold]
+    return keep_mask
 
 
 class PCWNet(nn.Module):
     """Probabilistic coarse-to-fine warp network for cross-view localization."""
 
     def __init__(self, config: Optional[PCWNetConfig] = None) -> None:
-        """Assemble the coarse matcher, refiners, and optional SVI reranker."""
+        """Assemble the coarse matcher, refiners, and optional candidate reranker."""
         super().__init__()
         self.config = config or PCWNetConfig()
         cfg = self.config
@@ -465,7 +560,7 @@ class PCWNet(nn.Module):
                 for level in cfg.refinement_levels
             }
         )
-        # Optional SVI-only cross-view candidate reranking module.
+        # Optional cross-view candidate reranking module.
         self.reranker = None
         if cfg.reranker:
             self.reranker = CrossViewReranker(
@@ -477,8 +572,10 @@ class PCWNet(nn.Module):
                 layers=cfg.reranker_layers,
                 patch_size=cfg.reranker_patch_size,
                 query_patch_scale=cfg.query_patch_scale,
+                refinement_dim=cfg.refinement_dim,
+                refinement_level_count=len(cfg.refinement_levels),
+                query_patch_scales=cfg.query_patch_scales,
             )
-
         # Coarse-backbone freezing policy.
         if cfg.freeze_coarse:
             for parameter in self.coarse_encoder.parameters():
@@ -547,9 +644,16 @@ class PCWNet(nn.Module):
             radius=cfg.local_softargmax_radius,
         )  # centers [B, K, 2], indices [B, K], scores [B, K]
         anchor_probabilities_flat = decoded["anchor_logits_flat"].softmax(dim=-1)  # [B, N]
-        anchor_scores = torch.gather(
-            anchor_probabilities_flat, 1, anchor_indices
+        candidate_anchor_logits = torch.gather(
+            decoded["anchor_logits_flat"], 1, anchor_indices
         )  # [B, K]
+        anchor_log_probs_flat = F.log_softmax(
+            decoded["anchor_logits_flat"], dim=1
+        )  # [B, N], calibrated over the full anchor grid
+        candidate_anchor_log_probs = torch.gather(
+            anchor_log_probs_flat, 1, anchor_indices
+        )  # [B, K]
+        anchor_scores = candidate_anchor_log_probs.exp()  # [B, K]
 
         size_logits = torch.gather(
             decoded["size_logits_flat"],
@@ -566,9 +670,10 @@ class PCWNet(nn.Module):
         refinement_states: List[torch.Tensor] = [states]
         refinement_certainties: List[torch.Tensor] = [certainty_logits]
         local_correlations: List[torch.Tensor] = []
+        refinement_hidden_states: List[torch.Tensor] = []
         for level in cfg.refinement_levels:
             query_token = prompt_weighted_pool(query_fine[level], prompt_map)  # [B, C_level]
-            states, certainty_logits, correlations = self.refiners[level](
+            states, certainty_logits, correlations, hidden = self.refiners[level](
                 query_token,
                 reference_fine[level],
                 states,
@@ -579,29 +684,44 @@ class PCWNet(nn.Module):
             refinement_states.append(states)  # Each element [B, K, 4]
             refinement_certainties.append(certainty_logits)  # Each element [B, K]
             local_correlations.append(correlations)  # Each element [B, K, S, S]
+            refinement_hidden_states.append(hidden)  # Each element [B, K, D]
 
         # Candidate score fusion, optional SVI reranking, and final selection.
         candidate_boxes = states_to_boxes(states)  # [B, K, 4]
         anchor_score_power = max(cfg.anchor_score_power, 0.0)  # scalar
         candidate_selection_logits = (
-            anchor_score_power * anchor_scores.clamp_min(1e-8).log()
+            anchor_score_power * candidate_anchor_log_probs
             + F.logsigmoid(certainty_logits)
         )  # [B, K]
-        svi_rerank_logits = torch.zeros_like(candidate_selection_logits)  # [B, K]
+        rerank_logits = torch.zeros_like(candidate_selection_logits)  # [B, K]
         if self.reranker is not None:
-            svi_rerank_logits = self.reranker(
+            rerank_logits = self.reranker(
                 query_fine,
                 reference_fine,
                 prompt_map,
                 states,
                 anchor_scores,
                 certainty_logits,
+                refinement_hidden_states,
             )  # [B, K]
             candidate_selection_logits = candidate_selection_logits + (
-                cfg.reranker_weight * svi_rerank_logits
+                cfg.reranker_weight * rerank_logits
             )  # [B, K]
-        candidate_scores = candidate_selection_logits.exp()  # [B, K]
-        selected_indices = candidate_scores.argmax(dim=1)  # [B]
+        if self.training:
+            # Do not let an early, incorrect score suppress the positive during
+            # selection/ranking supervision. NMS is applied only at inference.
+            candidate_keep_mask = torch.ones_like(
+                candidate_selection_logits, dtype=torch.bool
+            )
+        else:
+            candidate_keep_mask = candidate_nms_mask(
+                candidate_boxes, candidate_selection_logits, cfg.candidate_nms_iou
+            )  # [B, K]
+        masked_selection_logits = candidate_selection_logits.masked_fill(
+            ~candidate_keep_mask, torch.finfo(candidate_selection_logits.dtype).min
+        )  # [B, K]
+        candidate_scores = F.softmax(masked_selection_logits, dim=1)  # [B, K]
+        selected_indices = masked_selection_logits.argmax(dim=1)  # [B]
         batch_indices = torch.arange(batch, device=query_images.device)  # [B]
         boxes = candidate_boxes[batch_indices, selected_indices]  # [B, 4]
         scores = candidate_scores[batch_indices, selected_indices]  # [B]
@@ -614,16 +734,20 @@ class PCWNet(nn.Module):
             ),
             "candidate_anchor_indices": anchor_indices,
             "candidate_anchor_scores": anchor_scores,
+            "candidate_anchor_log_probs": candidate_anchor_log_probs,
             "candidate_centers": centers,
             "refinement_states": refinement_states,
             "refinement_certainties": refinement_certainties,
             "local_correlations": local_correlations,
+            "refinement_hidden_states": refinement_hidden_states,
             "candidate_boxes": candidate_boxes,
             "candidate_certainty_logits": certainty_logits,
             "candidate_selection_logits": candidate_selection_logits,
-            "svi_rerank_logits": svi_rerank_logits,
+            "candidate_keep_mask": candidate_keep_mask,
+            "rerank_logits": rerank_logits,
             "candidate_scores": candidate_scores,
             "selected_indices": selected_indices,
             "boxes": boxes,
             "scores": scores,
         }
+

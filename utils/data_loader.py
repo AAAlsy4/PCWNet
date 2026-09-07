@@ -6,7 +6,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import albumentations
-from shapely.geometry import Polygon
 
 
 cv2.setNumThreads(0)
@@ -199,9 +198,14 @@ class RSDataset(Dataset):
         rsimg = cv2.imread(os.path.join(self.rsimg_dir, rsimg_name))
         rsimg = cv2.cvtColor(rsimg, cv2.COLOR_BGR2RGB)
         if self.augment:
-            rs_transformed = self.rs_transform(image=rsimg, bboxes=[list(bbox)+[cls_name]])
+            rs_transformed = self.rs_transform(
+                image=rsimg,
+                bboxes=[list(bbox)],
+                class_labels=[cls_name],
+            )
             rsimg = rs_transformed['image']
-            bbox = rs_transformed['bboxes'][0][0:4]
+            bbox = rs_transformed['bboxes'][0]
+            cls_name = rs_transformed['class_labels'][0]
 
         # Norm, to tensor
         if self.transform is not None:

@@ -16,9 +16,11 @@ class LossConfig:
     warp_weight: float = 2.0
     box_l1_weight: float = 2.0
     giou_weight: float = 2.0
-    certainty_weight: float = 0.5
+    certainty_weight: float = 1.0
     selection_weight: float = 1.0
     selection_temperature: float = 0.1
+    ranking_weight: float = 1.0
+    ranking_margin_scale: float = 1.0
     selected_box_weight: float = 1.0
     anchor_soft_weight: float = 0.5
     anchor_soft_sigma: float = 0.75
@@ -103,6 +105,34 @@ def robust_charbonnier(
     return (scale**alpha) * (normalized.square() + 1.0).pow(alpha / 2)
 
 
+def pairwise_ranking_loss(
+    logits: torch.Tensor,
+    quality: torch.Tensor,
+    valid_mask: torch.Tensor,
+    margin_scale: float,
+) -> torch.Tensor:
+    """Rank every valid candidate pair using its detached IoU gap as margin."""
+    candidate_count = logits.shape[1]
+    if candidate_count < 2:
+        return logits.sum() * 0.0
+    first, second = torch.triu_indices(
+        candidate_count, candidate_count, offset=1, device=logits.device
+    )
+    quality_gap = quality[:, first] - quality[:, second]
+    pair_mask = (
+        valid_mask[:, first]
+        & valid_mask[:, second]
+        & (quality_gap.abs() > 1e-6)
+    )
+    if not pair_mask.any():
+        return logits.sum() * 0.0
+    logit_gap = logits[:, first] - logits[:, second]
+    direction = quality_gap.sign()
+    margin = quality_gap.abs() * max(margin_scale, 0.0)
+    losses = F.relu(margin - direction * logit_gap)
+    return losses[pair_mask].mean()
+
+
 class Criterion(nn.Module):
     """Combine coarse matching, box refinement, and candidate ranking losses."""
 
@@ -182,14 +212,26 @@ class Criterion(nn.Module):
             certainty_logits, candidate_ious.detach()
         )
         selection_logits = outputs["candidate_selection_logits"]
+        candidate_keep_mask = outputs.get(
+            "candidate_keep_mask", torch.ones_like(selection_logits, dtype=torch.bool)
+        )
         selection_temperature = max(cfg.selection_temperature, 1e-6)
-        selection_target = F.softmax(
-            candidate_ious.detach() / selection_temperature,
-            dim=1,
+        masked_target_logits = (candidate_ious.detach() / selection_temperature).masked_fill(
+            ~candidate_keep_mask, torch.finfo(selection_logits.dtype).min
+        )
+        selection_target = F.softmax(masked_target_logits, dim=1)
+        masked_selection_logits = selection_logits.masked_fill(
+            ~candidate_keep_mask, torch.finfo(selection_logits.dtype).min
         )
         selection_loss = -(
-            selection_target * F.log_softmax(selection_logits, dim=1)
+            selection_target * F.log_softmax(masked_selection_logits, dim=1)
         ).sum(dim=1).mean()
+        ranking_loss = pairwise_ranking_loss(
+            selection_logits,
+            candidate_ious.detach(),
+            candidate_keep_mask,
+            cfg.ranking_margin_scale,
+        )
         selected_index = outputs["selected_indices"]
         selected_boxes = candidate_boxes[rows, selected_index]
         selected_box_l1_loss = F.l1_loss(selected_boxes, target_boxes)
@@ -201,6 +243,7 @@ class Criterion(nn.Module):
             + cfg.warp_weight * warp_loss
             + cfg.certainty_weight * certainty_loss
             + cfg.selection_weight * selection_loss
+            + cfg.ranking_weight * ranking_loss
             + cfg.selected_box_weight * (selected_box_l1_loss + selected_giou_loss)
         )
         return {
@@ -213,6 +256,7 @@ class Criterion(nn.Module):
             "loss_giou": giou_loss,
             "loss_certainty": certainty_loss,
             "loss_selection": selection_loss,
+            "loss_ranking": ranking_loss,
             "loss_selected_box_l1": selected_box_l1_loss,
             "loss_selected_giou": selected_giou_loss,
         }
