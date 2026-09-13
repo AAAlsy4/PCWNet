@@ -8,6 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+SELECTION_TEMPERATURE = 0.1
+
+
 @dataclass
 class LossConfig:
     """Weights and robust-loss parameters used by ``Criterion``."""
@@ -16,11 +19,6 @@ class LossConfig:
     warp_weight: float = 2.0
     box_l1_weight: float = 2.0
     giou_weight: float = 2.0
-    certainty_weight: float = 1.0
-    selection_weight: float = 1.0
-    selection_temperature: float = 0.1
-    ranking_weight: float = 1.0
-    ranking_margin_scale: float = 1.0
     selected_box_weight: float = 1.0
     anchor_soft_weight: float = 0.5
     anchor_soft_sigma: float = 0.75
@@ -109,7 +107,6 @@ def pairwise_ranking_loss(
     logits: torch.Tensor,
     quality: torch.Tensor,
     valid_mask: torch.Tensor,
-    margin_scale: float,
 ) -> torch.Tensor:
     """Rank every valid candidate pair using its detached IoU gap as margin."""
     candidate_count = logits.shape[1]
@@ -128,7 +125,7 @@ def pairwise_ranking_loss(
         return logits.sum() * 0.0
     logit_gap = logits[:, first] - logits[:, second]
     direction = quality_gap.sign()
-    margin = quality_gap.abs() * max(margin_scale, 0.0)
+    margin = quality_gap.abs()
     losses = F.relu(margin - direction * logit_gap)
     return losses[pair_mask].mean()
 
@@ -215,8 +212,9 @@ class Criterion(nn.Module):
         candidate_keep_mask = outputs.get(
             "candidate_keep_mask", torch.ones_like(selection_logits, dtype=torch.bool)
         )
-        selection_temperature = max(cfg.selection_temperature, 1e-6)
-        masked_target_logits = (candidate_ious.detach() / selection_temperature).masked_fill(
+        masked_target_logits = (
+            candidate_ious.detach() / SELECTION_TEMPERATURE
+        ).masked_fill(
             ~candidate_keep_mask, torch.finfo(selection_logits.dtype).min
         )
         selection_target = F.softmax(masked_target_logits, dim=1)
@@ -230,7 +228,6 @@ class Criterion(nn.Module):
             selection_logits,
             candidate_ious.detach(),
             candidate_keep_mask,
-            cfg.ranking_margin_scale,
         )
         selected_index = outputs["selected_indices"]
         selected_boxes = candidate_boxes[rows, selected_index]
@@ -241,9 +238,9 @@ class Criterion(nn.Module):
             + cfg.box_l1_weight * box_l1_loss
             + cfg.giou_weight * giou_loss
             + cfg.warp_weight * warp_loss
-            + cfg.certainty_weight * certainty_loss
-            + cfg.selection_weight * selection_loss
-            + cfg.ranking_weight * ranking_loss
+            + certainty_loss
+            + selection_loss
+            + ranking_loss
             + cfg.selected_box_weight * (selected_box_l1_loss + selected_giou_loss)
         )
         return {

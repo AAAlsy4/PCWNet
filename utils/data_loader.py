@@ -167,7 +167,8 @@ class RSDataset(Dataset):
 		        albumentations.CLAHE(p=0.3),
 	        ], p=0.5),
 	        albumentations.ToGray(p=0.2),
-	        albumentations.RandomGamma(p=0.3),], bbox_params=albumentations.BboxParams(format='pascal_voc'))
+	        albumentations.RandomGamma(p=0.3),], bbox_params=albumentations.BboxParams(
+                format='pascal_voc', label_fields=['class_labels']))
         self.query_transform = albumentations.Compose([
             albumentations.OneOf([
                 albumentations.Blur(p=0.5),

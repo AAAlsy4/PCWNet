@@ -18,22 +18,20 @@ from utils.utils import prompt_weighted_pool, local_soft_argmax_2d, sample_candi
 
 TensorDict = Dict[str, torch.Tensor]
 
+ANCHOR_SCORE_POWER = 0.5
+CANDIDATE_NMS_IOU = 0.7
+
 
 @dataclass
 class PCWNetConfig:
     """Hyperparameters controlling the PCWNet model architecture."""
 
-    pretrained_backbones: bool = True
-    freeze_coarse: bool = True
     decoder_dim: int = 512
     decoder_heads: int = 8
     decoder_layers: int = 5
     decoder_ffn_dim: int = 2048
     anchor_grid_size: Tuple[int, int] = (32, 32)
-    topk: int = 5
-    anchor_score_power: float = 0.5
-    reranker: bool = True
-    reranker_weight: float = 1.0
+    topk: int = 7
     reranker_dim: int = 128
     reranker_heads: int = 4
     reranker_layers: int = 2
@@ -41,26 +39,12 @@ class PCWNetConfig:
     query_patch_scale: float = 0.25
     # Each tuple is (normalized width, normalized height) for a query patch.
     query_patch_scales: Tuple[Tuple[float, float], ...] = ((0.25, 0.25),)
-    candidate_nms_iou: float = 0.7
     local_softargmax_radius: int = 1
     refinement_levels: Tuple[str, ...] = ("layer3", "layer2", "layer1")
     refinement_dim: int = 256
     refinement_patch_size: int = 7
     min_box_size: float = 1.0 / 1024.0
     max_box_size: float = 1.0
-
-
-def query_patch_scales_for_dataset(
-    data_name: str,
-) -> Tuple[Tuple[float, float], ...]:
-    """Return view-aware query windows for the reranker.
-
-    SVI queries are 2:1 wide images, so Ground uses anisotropic context at
-    multiple scales. Drone queries remain square and use the original window.
-    """
-    if data_name == "CVOGL_SVI":
-        return ((0.25, 0.25), (0.50, 0.30), (0.75, 0.40))
-    return ((0.25, 0.25),)
 
 
 class CoarseSemanticEncoder(nn.Module):
@@ -519,19 +503,15 @@ class PCWNet(nn.Module):
     """Probabilistic coarse-to-fine warp network for cross-view localization."""
 
     def __init__(self, config: Optional[PCWNetConfig] = None) -> None:
-        """Assemble the coarse matcher, refiners, and optional candidate reranker."""
+        """Assemble the coarse matcher, refiners, and candidate reranker."""
         super().__init__()
         self.config = config or PCWNetConfig()
         cfg = self.config
 
         # Shared coarse encoder and view-specific fine feature pyramids.
-        self.coarse_encoder = CoarseSemanticEncoder(cfg.pretrained_backbones)
-        self.query_fine_encoder = FineFeaturePyramid(
-            cfg.pretrained_backbones
-        )
-        self.reference_fine_encoder = FineFeaturePyramid(
-            cfg.pretrained_backbones
-        )
+        self.coarse_encoder = CoarseSemanticEncoder(pretrained=True)
+        self.query_fine_encoder = FineFeaturePyramid(pretrained=True)
+        self.reference_fine_encoder = FineFeaturePyramid(pretrained=True)
 
         # Prompt-conditioned coarse anchor matching module.
         self.query_coarse_proj = nn.Linear(
@@ -560,40 +540,34 @@ class PCWNet(nn.Module):
                 for level in cfg.refinement_levels
             }
         )
-        # Optional cross-view candidate reranking module.
-        self.reranker = None
-        if cfg.reranker:
-            self.reranker = CrossViewReranker(
-                query_channels=FineFeaturePyramid.out_channels,
-                reference_channels=FineFeaturePyramid.out_channels,
-                levels=("layer3", "layer2"),
-                hidden_dim=cfg.reranker_dim,
-                heads=cfg.reranker_heads,
-                layers=cfg.reranker_layers,
-                patch_size=cfg.reranker_patch_size,
-                query_patch_scale=cfg.query_patch_scale,
-                refinement_dim=cfg.refinement_dim,
-                refinement_level_count=len(cfg.refinement_levels),
-                query_patch_scales=cfg.query_patch_scales,
-            )
-        # Coarse-backbone freezing policy.
-        if cfg.freeze_coarse:
-            for parameter in self.coarse_encoder.parameters():
-                parameter.requires_grad_(False)
+        # Cross-view candidate reranking module.
+        self.reranker = CrossViewReranker(
+            query_channels=FineFeaturePyramid.out_channels,
+            reference_channels=FineFeaturePyramid.out_channels,
+            levels=("layer3", "layer2"),
+            hidden_dim=cfg.reranker_dim,
+            heads=cfg.reranker_heads,
+            layers=cfg.reranker_layers,
+            patch_size=cfg.reranker_patch_size,
+            query_patch_scale=cfg.query_patch_scale,
+            refinement_dim=cfg.refinement_dim,
+            refinement_level_count=len(cfg.refinement_levels),
+            query_patch_scales=cfg.query_patch_scales,
+        )
+        # The coarse semantic encoder stays frozen and in eval mode.
+        for parameter in self.coarse_encoder.parameters():
+            parameter.requires_grad_(False)
 
     def train(self, mode: bool = True) -> "PCWNet":
-        """Set training mode while keeping configured frozen encoders in eval mode."""
+        """Set training mode while keeping the frozen coarse encoder in eval mode."""
         super().train(mode)
-        if self.config.freeze_coarse:
-            self.coarse_encoder.eval()
+        self.coarse_encoder.eval()
         return self
 
     def _encode_coarse(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images with gradients disabled when the coarse encoder is frozen."""
-        if self.config.freeze_coarse:
-            with torch.no_grad():
-                return self.coarse_encoder(images)
-        return self.coarse_encoder(images)
+        """Encode images with gradients disabled for the frozen coarse encoder."""
+        with torch.no_grad():
+            return self.coarse_encoder(images)
 
     def forward(
         self,
@@ -686,27 +660,25 @@ class PCWNet(nn.Module):
             local_correlations.append(correlations)  # Each element [B, K, S, S]
             refinement_hidden_states.append(hidden)  # Each element [B, K, D]
 
-        # Candidate score fusion, optional SVI reranking, and final selection.
+        # Candidate score fusion, cross-view reranking, and final selection.
         candidate_boxes = states_to_boxes(states)  # [B, K, 4]
-        anchor_score_power = max(cfg.anchor_score_power, 0.0)  # scalar
         candidate_selection_logits = (
-            anchor_score_power * candidate_anchor_log_probs
+            ANCHOR_SCORE_POWER * candidate_anchor_log_probs
             + F.logsigmoid(certainty_logits)
         )  # [B, K]
-        rerank_logits = torch.zeros_like(candidate_selection_logits)  # [B, K]
-        if self.reranker is not None:
-            rerank_logits = self.reranker(
-                query_fine,
-                reference_fine,
-                prompt_map,
-                states,
-                anchor_scores,
-                certainty_logits,
-                refinement_hidden_states,
-            )  # [B, K]
-            candidate_selection_logits = candidate_selection_logits + (
-                cfg.reranker_weight * rerank_logits
-            )  # [B, K]
+        # Reranking decides the order of the surviving candidates.
+        rerank_logits = self.reranker(
+            query_fine,
+            reference_fine,
+            prompt_map,
+            states,
+            anchor_scores,
+            certainty_logits,
+            refinement_hidden_states,
+        )  # [B, K]
+        candidate_selection_logits = (
+            candidate_selection_logits + rerank_logits
+        )  # [B, K]
         if self.training:
             # Do not let an early, incorrect score suppress the positive during
             # selection/ranking supervision. NMS is applied only at inference.
@@ -715,7 +687,7 @@ class PCWNet(nn.Module):
             )
         else:
             candidate_keep_mask = candidate_nms_mask(
-                candidate_boxes, candidate_selection_logits, cfg.candidate_nms_iou
+                candidate_boxes, candidate_selection_logits, CANDIDATE_NMS_IOU
             )  # [B, K]
         masked_selection_logits = candidate_selection_logits.masked_fill(
             ~candidate_keep_mask, torch.finfo(candidate_selection_logits.dtype).min

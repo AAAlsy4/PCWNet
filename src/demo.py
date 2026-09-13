@@ -1,320 +1,206 @@
+from __future__ import annotations
+
+import argparse
 import os
 import sys
-import argparse
+from dataclasses import fields
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import cv2
+import numpy as np
+import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import cv2
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-
-from model.PCWNet import PCWNet, PCWNetConfig, query_patch_scales_for_dataset
+from model.PCWNet import PCWNet, PCWNetConfig
 from utils.data_loader import RSDataset
+from utils.utils import states_to_boxes
 
 
-GROUND_TRUTH_COLOR=(0,255,0)
-CANDIDATE_COLOR=(0,0,255)
-PREDICTION_COLOR=(255,0,0)
-PROMPT_COLOR=(0,255,0)
-
-
-def positive_int(value: str) -> int:
-    """Parse a strictly positive integer for argparse."""
-    parsed=int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("value must be a positive integer")
-    return parsed
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse command-line options for the visualization demo."""
-    parser=argparse.ArgumentParser("PCWNet visualization demo")
-    parser.add_argument("--data_root", default="./data")
-    parser.add_argument("--data_name", default="CVOGL_DroneAerial")
-    parser.add_argument("--split", default="test")
-    parser.add_argument("--index", type=int, default=0, help="image pair index")
-    parser.add_argument("--checkpoint", default="saved_models/PCWNet_best.pth")
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--save_dir", default="vis")
-    parser.add_argument("--topk", type=positive_int, default=5,
-        help="number of candidate boxes to refine")
-    parser.add_argument("--anchor_score_power", type=float, default=0.5)
-    parser.add_argument("--reranker_weight", type=float, default=1.0)
-    parser.add_argument("--candidate_nms_iou", type=float, default=0.7)
-
-    return parser.parse_args()
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+CANDIDATE_COLORS = (
+    (0, 114, 178),
+    (230, 159, 0),
+    (204, 121, 167),
+    (86, 180, 233),
+    (240, 228, 66),
+    (128, 0, 128),
+    (0, 128, 128),
+)
+GT_COLOR = (0, 190, 70)
+PRED_COLOR = (220, 40, 40)
 
 
 class ImageNetTransform:
-    """Convert images to ImageNet-normalized tensors and restore them for display."""
-
-    def __init__(self):
-        """Store ImageNet normalization statistics."""
-
-        self.mean=torch.tensor([0.485,0.456,0.406])[:,None,None]
-        self.std=torch.tensor([0.229,0.224,0.225])[:,None,None]
-
-    def __call__(self, image):
-        """Normalize an RGB image array and return a channel-first tensor."""
-
-        tensor=torch.from_numpy(np.ascontiguousarray(image)).permute(2,0,1)
-        tensor=tensor.float().div(255.0)
-        return (tensor-self.mean)/self.std
-
-    def denormalize(self, img_tensor):
-
-        """Reverse normalization: img * std + mean recovers [0,1], then scale to uint8 [0,255]."""
-        img=img_tensor*self.std+self.mean
-        img=img.clamp(0,1)
-        img=(img*255).byte()
-        return img
+    def __call__(self, image: np.ndarray) -> torch.Tensor:
+        array = image.astype(np.float32) / 255.0
+        array = (array - IMAGENET_MEAN) / IMAGENET_STD
+        return torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1)
 
 
-def save_img(path,img) -> None:
-    """Convert an RGB image to BGR and write it to disk."""
-    img=cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(path,img)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data_root", default="data")
+    parser.add_argument("--data_name", default="CVOGL_DroneAerial")
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--checkpoint", default="saved_models/PCWNet_best.pth")
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0")
+    parser.add_argument("--save_dir", default="vis")
+    parser.add_argument("--topk", type=int, default=7)
+    return parser.parse_args()
 
 
-def draw_box(img, box, color) -> np.ndarray:
-    """Draw a normalized XYXY box on an image copy."""
-    out=img.copy()
-    h,w,_=out.shape
-    x1,y1,x2,y2=np.clip(np.asarray(box), 0.0, 1.0)
-    x1=int(x1*w)
-    y1=int(y1*h)
-    x2=int(x2*w)
-    y2=int(y2*h)
-    cv2.rectangle(out, (x1,y1), (x2,y2), color, 3)
-
-    return out
-
-
-def draw_boxes(img, boxes, color) -> np.ndarray:
-    """Draw a collection of normalized XYXY boxes in one color."""
-    out=img.copy()
-    for box in boxes:
-        out=draw_box(out, box, color)
-    return out
+def load_model(args: argparse.Namespace, device: torch.device) -> PCWNet:
+    path = Path(args.checkpoint)
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu")
+    saved = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+    valid = {field.name for field in fields(PCWNetConfig)}
+    values = {key: value for key, value in saved.items() if key in valid}
+    values["topk"] = args.topk
+    values["query_patch_scales"] = ((0.25, 0.25), (0.50, 0.30), (0.75, 0.40)) if args.data_name == "CVOGL_SVI" else ((0.25, 0.25),)
+    model = PCWNet(PCWNetConfig(**values)).to(device)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
 
 
-def add_legend(img, entries) -> np.ndarray:
-    """Add a compact box-color legend to the top-right image corner."""
-    out=img.copy()
-    font=cv2.FONT_HERSHEY_SIMPLEX
-    font_scale=0.55
-    thickness=1
-    padding=12
-    swatch_size=20
-    row_height=30
-    text_width=max(
-        cv2.getTextSize(label, font, font_scale, thickness)[0][0]
-        for label,_ in entries
-    )
-    legend_width=padding*3+swatch_size+text_width
-    legend_height=padding*2+row_height*len(entries)
-    x1=max(out.shape[1]-legend_width-padding, 0)
-    y1=padding
-    x2=min(x1+legend_width, out.shape[1]-1)
-    y2=min(y1+legend_height, out.shape[0]-1)
+def tensor_to_rgb(tensor: torch.Tensor) -> np.ndarray:
+    image = tensor.detach().cpu().permute(1, 2, 0).numpy()
+    image = image * IMAGENET_STD + IMAGENET_MEAN
+    return np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
-    overlay=out.copy()
-    cv2.rectangle(overlay, (x1,y1), (x2,y2), (255,255,255), -1)
-    out=cv2.addWeighted(overlay, 0.85, out, 0.15, 0)
-    cv2.rectangle(out, (x1,y1), (x2,y2), (0,0,0), 1)
 
-    for index,(label,color) in enumerate(entries):
-        row_y=y1+padding+index*row_height
-        swatch_y=row_y+(row_height-swatch_size)//2
-        swatch_x=x1+padding
-        cv2.rectangle(
-            out,
-            (swatch_x,swatch_y),
-            (swatch_x+swatch_size,swatch_y+swatch_size),
-            color,
-            3,
+def save_rgb(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR)):
+        raise OSError(f"Could not write image: {path}")
+
+
+def pixel_box(box: Sequence[float], width: int, height: int) -> np.ndarray:
+    result = np.asarray(box, dtype=np.float32).copy()
+    if np.max(np.abs(result)) <= 1.5:
+        result *= np.array([width, height, width, height], dtype=np.float32)
+    result[[0, 2]] = np.clip(result[[0, 2]], 0, width - 1)
+    result[[1, 3]] = np.clip(result[[1, 3]], 0, height - 1)
+    return result
+
+
+def label_box(image: np.ndarray, box: Sequence[float], color: tuple[int, int, int],
+              label: str, thickness: int = 3) -> None:
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = pixel_box(box, width, height).round().astype(int)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+    if not label:
+        return
+    scale = max(min(width, height) / 1000.0, 0.55)
+    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    top = max(y1 - th - baseline - 8, 0)
+    cv2.rectangle(image, (x1, top), (min(x1 + tw + 10, width - 1),
+                  min(top + th + baseline + 8, height - 1)), color, -1)
+    cv2.putText(image, label, (x1 + 5, top + th + 2), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def draw_candidates(image: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    canvas = image.copy()
+    for index, box in enumerate(boxes):
+        color = CANDIDATE_COLORS[index % len(CANDIDATE_COLORS)]
+        label_box(canvas, box, color, f"C{index + 1}", 3)
+    return canvas
+
+
+def heatmap_overlay(image: np.ndarray, probabilities: np.ndarray) -> np.ndarray:
+    heat = probabilities.astype(np.float32)
+    heat /= max(float(heat.max()), 1e-12)
+    heat = cv2.resize(heat, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_CUBIC)
+    colored = cv2.applyColorMap(np.uint8(np.clip(heat, 0, 1) * 255), cv2.COLORMAP_MAGMA)
+    colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+    alpha = (0.18 + 0.42 * heat)[..., None]
+    return np.uint8(np.clip(image * (1.0 - alpha) + colored * alpha, 0, 255))
+
+
+def intersection_over_union(first: Sequence[float], second: Sequence[float]) -> float:
+    a, b = np.asarray(first, dtype=np.float32), np.asarray(second, dtype=np.float32)
+    left, top = np.maximum(a[:2], b[:2])
+    right, bottom = np.minimum(a[2:], b[2:])
+    intersection = max(float(right - left), 0.0) * max(float(bottom - top), 0.0)
+    area_a = max(float(a[2] - a[0]), 0.0) * max(float(a[3] - a[1]), 0.0)
+    area_b = max(float(b[2] - b[0]), 0.0) * max(float(b[3] - b[1]), 0.0)
+    return intersection / max(area_a + area_b - intersection, 1e-12)
+
+
+def export_sample(model: PCWNet, dataset: RSDataset, index: int,
+                  args: argparse.Namespace, device: torch.device) -> Path:
+    query, reference, prompt, ground_truth, _, _ = dataset[index]
+    with torch.inference_mode():
+        outputs = model(query[None].to(device), reference[None].to(device),
+                        torch.as_tensor(prompt)[None].to(device))
+
+    query_rgb, reference_rgb = tensor_to_rgb(query), tensor_to_rgb(reference)
+    output_dir = Path(args.save_dir)
+
+    prompt_panel = query_rgb.copy()
+    py, px = np.unravel_index(np.argmax(prompt), prompt.shape)
+    qx = int(round(px * (query_rgb.shape[1] - 1) / max(prompt.shape[1] - 1, 1)))
+    qy = int(round(py * (query_rgb.shape[0] - 1) / max(prompt.shape[0] - 1, 1)))
+    radius = max(min(query_rgb.shape[:2]) // 60, 5)
+    cv2.circle(prompt_panel, (qx, qy), radius + 3, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(prompt_panel, (qx, qy), radius, GT_COLOR, -1, cv2.LINE_AA)
+    save_rgb(output_dir / "01_query_point_prompt.png", prompt_panel)
+
+    ground_truth_panel = reference_rgb.copy()
+    label_box(ground_truth_panel, ground_truth, GT_COLOR, "Ground Truth")
+    save_rgb(output_dir / "02_satellite_ground_truth.png", ground_truth_panel)
+
+    states = outputs["refinement_states"]
+    coarse_boxes = states_to_boxes(states[0])[0].cpu().numpy()
+    heat = outputs["anchor_probabilities"][0].cpu().numpy()
+    coarse_panel = draw_candidates(heatmap_overlay(reference_rgb, heat), coarse_boxes)
+    save_rgb(output_dir / "03_coarse_topk_candidates.png", coarse_panel)
+
+    level_names = list(model.refiners.keys())
+    for level, filename in (("layer3", "04_candidates_after_layer3.png"),
+                            ("layer1", "05_candidates_after_layer1.png")):
+        if level not in level_names:
+            raise RuntimeError(f"Checkpoint model has no {level} refinement stage")
+        state_index = level_names.index(level) + 1
+        boxes = states_to_boxes(states[state_index])[0].cpu().numpy()
+        save_rgb(output_dir / filename, draw_candidates(reference_rgb, boxes))
+
+    final_box = outputs["boxes"][0].cpu().numpy()
+    selected = int(outputs["selected_indices"][0].item()) + 1
+    normalized_gt = np.asarray(ground_truth, dtype=np.float32)
+    if np.max(np.abs(normalized_gt)) > 1.5:
+        normalized_gt = normalized_gt / np.array(
+            [reference_rgb.shape[1], reference_rgb.shape[0],
+             reference_rgb.shape[1], reference_rgb.shape[0]], dtype=np.float32
         )
-        text_y=row_y+(row_height+10)//2
-        cv2.putText(
-            out,
-            label,
-            (swatch_x+swatch_size+padding,text_y),
-            font,
-            font_scale,
-            (0,0,0),
-            thickness,
-            cv2.LINE_AA,
-        )
-
-    return out
-
-
-def normalize_box(box, image) -> np.ndarray:
-    """Normalize a pixel-space XYXY box against an image array."""
-    height,width=image.shape[:2]
-    scale=np.array([width,height,width,height], dtype=np.float32)
-    return np.clip(np.asarray(box, dtype=np.float32)/scale, 0.0, 1.0)
-
-
-def vis_prompt(query_img, prompt_map, save) -> None:
-    """Visualize the click prompt on the query image."""
-    h,w=prompt_map.shape
-    cy,cx=np.unravel_index(prompt_map.argmax(), prompt_map.shape)
-    # Map back to image coordinates (prompt map is 256x256, image may differ)
-    cx_img=int(cx*query_img.shape[1]/w)
-    cy_img=int(cy*query_img.shape[0]/h)
-    img=query_img.copy()
-    cv2.circle(img, (cx_img,cy_img), 12, PROMPT_COLOR, 3)
-    cv2.circle(img, (cx_img,cy_img), 4, PROMPT_COLOR, -1)
-    save_img(save, img)
-
-
-def vis_heatmap(sat, logits, save) -> None:
-    """Overlay normalized anchor logits on the reference image."""
-    heatmap=logits.cpu().numpy()
-    heatmap=np.exp(heatmap-heatmap.max())
-    heatmap/=heatmap.max()
-    heatmap=cv2.resize(heatmap, (sat.shape[1], sat.shape[0]))
-    plt.figure(figsize=(8,8))
-    plt.imshow(sat)
-    plt.imshow(heatmap, cmap="jet", alpha=0.5)
-    plt.axis("off")
-    plt.savefig(save, dpi=300, bbox_inches="tight")
-    plt.close()
-
-
-def vis_candidates(sat, outputs, target_box, save) -> None:
-    """Draw all final candidate boxes and the dataset ground truth."""
-    boxes=outputs["candidate_boxes"][0].cpu().numpy()
-    img=draw_boxes(sat, boxes, CANDIDATE_COLOR)
-    img=draw_box(img, target_box, GROUND_TRUTH_COLOR)
-    img=add_legend(img, [
-        ("Candidates", CANDIDATE_COLOR),
-        ("Ground truth", GROUND_TRUTH_COLOR),
-    ])
-
-    save_img(save, img)
-
-
-def state_to_box(state) -> torch.Tensor:
-    """Convert batched center/log-size states to XYXY boxes."""
-    center=state[:,:,:2]
-    size=torch.exp(state[:,:,2:])
-
-    return torch.cat([center-size/2, center+size/2], dim=-1)
-
-
-def vis_refinement(sat, outputs, target_box, save_dir) -> None:
-    """Save cumulative trajectories for every candidate refinement state."""
-    colors=[(0,0,255), (0,255,255), (255,165,0), (255,0,255)]
-    names=["init","layer3","layer2","layer1"]
-    labels=["Initial","After layer3","After layer2","After layer1"]
-    trajectory=sat.copy()
-    legend_entries=[]
-
-    for i,state in enumerate(outputs["refinement_states"]):
-        boxes=state_to_box(state)[0].cpu().numpy()
-        trajectory=draw_boxes(trajectory, boxes, colors[i])
-        legend_entries.append((labels[i], colors[i]))
-        stage_img=draw_box(trajectory, target_box, GROUND_TRUTH_COLOR)
-        stage_img=add_legend(stage_img, legend_entries+[
-            ("Ground truth", GROUND_TRUTH_COLOR),
-        ])
-        save_img(os.path.join(save_dir, f"{i+7:02d}_{names[i]}.jpg"), stage_img)
-
-    trajectory=draw_box(trajectory, target_box, GROUND_TRUTH_COLOR)
-    trajectory=add_legend(trajectory, legend_entries+[
-        ("Ground truth", GROUND_TRUTH_COLOR),
-    ])
-    save_img(os.path.join(save_dir, "06_refinement_trajectory.jpg"), trajectory)
-
-
-def vis_final(sat, outputs, target_box, save) -> None:
-    """Draw the selected final prediction against the dataset ground truth."""
-    box=outputs["boxes"][0].cpu().numpy()
-    img=draw_box(sat, box, PREDICTION_COLOR)
-    img=draw_box(img, target_box, GROUND_TRUTH_COLOR)
-    img=add_legend(img, [
-        ("Prediction", PREDICTION_COLOR),
-        ("Ground truth", GROUND_TRUTH_COLOR),
-    ])
-    save_img(save, img)
-
-
-def resolve_device(name: str) -> torch.device:
-    """Resolve an explicit device name or choose CUDA when available."""
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
+    final_panel = reference_rgb.copy()
+    label_box(final_panel, ground_truth, GT_COLOR, "Ground Truth")
+    label_box(final_panel, final_box, PRED_COLOR,
+              f"Pred C{selected}  IoU={intersection_over_union(final_box, normalized_gt):.3f}")
+    save_rgb(output_dir / "06_final_reranked_prediction.png", final_panel)
+    return output_dir
 
 
 def main() -> None:
-    """Load one dataset pair, run PCWNet, and save diagnostic visualizations."""
-    args=parse_args()
-    os.makedirs(args.save_dir,exist_ok=True)
-    device = resolve_device(args.device)
-
-    dataset=RSDataset(
-        data_root=args.data_root,
-        data_name=args.data_name,
-        split_name=args.split,
-        img_size=1024,
-        transform=ImageNetTransform(),
-        augment=False
-    )
-
-    query,reference,prompt,boxes,_,_=dataset[args.index]
-    query=query.unsqueeze(0).to(device)
-    reference=reference.unsqueeze(0).to(device)
-    prompt=torch.from_numpy(prompt).unsqueeze(0).to(device)
-
-    transform=ImageNetTransform()
-    query_vis=transform.denormalize(query[0].cpu()).permute(1,2,0).numpy()
-    reference_vis=transform.denormalize(reference[0].cpu()).permute(1,2,0).numpy()
-    target_box=normalize_box(boxes, reference_vis)
-
-    model=PCWNet(PCWNetConfig(
-        topk=args.topk,
-        anchor_score_power=args.anchor_score_power,
-        reranker=True,
-        reranker_weight=args.reranker_weight,
-        query_patch_scales=query_patch_scales_for_dataset(args.data_name),
-        candidate_nms_iou=args.candidate_nms_iou,
-    ))
-    ckpt=torch.load(args.checkpoint,map_location="cpu")
-    model.load_state_dict(ckpt["state_dict"], strict=True)
-    model.to(device)
-    model.eval()
-
-    with torch.no_grad():
-        outputs=model(query,reference,prompt)
-
-    save_img(os.path.join(args.save_dir, "01_query_image.jpg"), query_vis)
-    save_img(os.path.join(args.save_dir, "02_reference_image.jpg"), reference_vis)
-
-    vis_prompt(query_vis, prompt[0].cpu().numpy(),
-        os.path.join(args.save_dir, "03_prompt.jpg")
-    )
-
-    vis_heatmap(reference_vis, outputs["anchor_logits"][0],
-        os.path.join(args.save_dir, "04_anchor_heatmap.jpg")
-    )
-
-    vis_candidates(reference_vis, outputs, target_box,
-        os.path.join(args.save_dir, "05_topK_candidates.jpg")
-    )
-
-    vis_refinement(reference_vis, outputs, target_box, args.save_dir)
-
-    vis_final(reference_vis, outputs, target_box,
-        os.path.join(args.save_dir, "11_final_prediction.jpg")
-    )
+    args = parse_args()
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
+                          else "cpu" if args.device == "auto" else args.device)
+    dataset = RSDataset(args.data_root, args.data_name, args.split,
+                        transform=ImageNetTransform(), augment=False)
+    model = load_model(args, device)
+    if not 0 <= args.index < len(dataset):
+        raise IndexError(f"Sample index {args.index} is outside [0, {len(dataset) - 1}]")
+    output_dir = export_sample(model, dataset, args.index, args, device)
+    print(f"Saved to {output_dir}")
 
 
-    print("Visualization finished!")
-
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
-

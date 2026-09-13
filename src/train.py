@@ -17,9 +17,12 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model.loss import Criterion, LossConfig, aligned_iou, normalize_xyxy_boxes
-from model.PCWNet import PCWNetConfig, PCWNet, query_patch_scales_for_dataset
+from model.loss import Criterion, aligned_iou, normalize_xyxy_boxes
+from model.PCWNet import PCWNetConfig, PCWNet
 from utils.data_loader import RSDataset
+
+
+WARMUP_EPOCHS = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,36 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--topk", type=int, default=7)
-    parser.add_argument("--warmup_epochs", type=int, default=2)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument(
-        "--finetune_epochs",
-        type=int,
-        default=5,
-        help="epochs to fine-tune on train+val after model selection; 0 disables it",
-    )
-    parser.add_argument(
-        "--finetune_lr",
-        type=float,
-        default=None,
-        help="train+val fine-tuning learning rate (default: 0.1 * --lr)",
-    )
-    parser.add_argument("--certainty_weight", type=float, default=1.0)
-    parser.add_argument("--selection_weight", type=float, default=1.0)
-    parser.add_argument("--selection_temperature", type=float, default=0.1)
-    parser.add_argument("--ranking_weight", type=float, default=1.0)
-    parser.add_argument("--ranking_margin_scale", type=float, default=1.0)
-    parser.add_argument("--anchor_score_power", type=float, default=0.5)
-    parser.add_argument("--reranker_weight", type=float, default=1.0)
-    parser.add_argument("--no_reranker", dest="reranker", action="store_false")
-    parser.add_argument("--candidate_nms_iou", type=float, default=0.7)
-    parser.add_argument("--no_pretrained_backbones", dest="pretrained_backbones", action="store_false")
-    parser.add_argument("--train_coarse_backbone", dest="freeze_coarse", action="store_false")
-    parser.set_defaults(
-        pretrained_backbones=True,
-        freeze_coarse=True,
-        reranker=True,
-    )
+    parser.add_argument("--finetune_epochs", type=int, default=5)
+    parser.add_argument("--finetune_lr", type=float, default=None)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--checkpoint", default="saved_models/PCWNet_best.pth")
@@ -72,13 +47,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="val", choices=["val", "test"])
     parser.add_argument("--print_freq", type=int, default=100)
     return parser.parse_args()
-
-
-def resolve_device(name: str) -> torch.device:
-    """Resolve an explicit device name or choose CUDA when available."""
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
 
 
 def set_seed(seed: int) -> None:
@@ -107,26 +75,14 @@ def validate_args(args: argparse.Namespace) -> None:
 def build_model(args: argparse.Namespace) -> PCWNet:
     """Construct PCWNet with candidate reranking enabled for all datasets."""
     return PCWNet(PCWNetConfig(
-        pretrained_backbones=args.pretrained_backbones,
-        freeze_coarse=args.freeze_coarse and args.pretrained_backbones,
         topk=args.topk,
-        anchor_score_power=args.anchor_score_power,
-        reranker=args.reranker,
-        reranker_weight=args.reranker_weight,
-        query_patch_scales=query_patch_scales_for_dataset(args.data_name),
-        candidate_nms_iou=args.candidate_nms_iou,
+        query_patch_scales=((0.25, 0.25), (0.50, 0.30), (0.75, 0.40)) if args.data_name == "CVOGL_SVI" else ((0.25, 0.25),),
     ))
 
 
-def build_criterion(args: argparse.Namespace) -> Criterion:
-    """Construct the training criterion from command-line loss weights."""
-    return Criterion(LossConfig(
-        certainty_weight=args.certainty_weight,
-        selection_weight=args.selection_weight,
-        selection_temperature=args.selection_temperature,
-        ranking_weight=args.ranking_weight,
-        ranking_margin_scale=args.ranking_margin_scale,
-    ))
+def build_criterion() -> Criterion:
+    """Construct the training criterion with its default loss weights."""
+    return Criterion()
 
 
 def build_optimizer(
@@ -156,7 +112,6 @@ def build_optimizer(
     return torch.optim.AdamW(
         parameter_groups,
         lr=head_lr,
-        weight_decay=args.weight_decay,
     )
 
 
@@ -165,12 +120,12 @@ def build_scheduler(
     optimizer: torch.optim.Optimizer,
     epochs: int | None = None,
     lr: float | None = None,
-    warmup_epochs: int | None = None,
+    warmup_epochs: int = WARMUP_EPOCHS,
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """Create a linear-warmup and cosine-decay learning-rate scheduler."""
     total_epochs = args.epochs if epochs is None else epochs
     base_lr = args.lr if lr is None else lr
-    warmup = args.warmup_epochs if warmup_epochs is None else warmup_epochs
+    warmup = warmup_epochs
     warmup = min(max(warmup, 0), max(total_epochs - 1, 0))
     min_factor = min(max(args.min_lr / max(base_lr, 1e-12), 0.0), 1.0)
 
@@ -451,11 +406,11 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     set_seed(args.seed)
-    device = resolve_device(args.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
     print(json.dumps(vars(args), ensure_ascii=False, indent=2))
     print(f"device={device}")
     model = build_model(args).to(device)
-    criterion = build_criterion(args).to(device)
+    criterion = build_criterion().to(device)
     if args.eval:
         if not args.resume:
             raise ValueError("--eval requires --resume")
