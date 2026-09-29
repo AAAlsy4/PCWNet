@@ -17,9 +17,12 @@ class LossConfig:
 
     anchor_weight: float = 1.0
     warp_weight: float = 2.0
-    box_l1_weight: float = 2.0
+    best_box_weight: float = 2.0
     giou_weight: float = 2.0
     selected_box_weight: float = 1.0
+    certainty_weight: float = 1.0
+    selection_weight: float = 1.0
+    ranking_weight: float = 1.0
     anchor_soft_weight: float = 0.5
     anchor_soft_sigma: float = 0.75
     robust_alpha: float = 0.5
@@ -235,13 +238,12 @@ class Criterion(nn.Module):
         selected_giou_loss = aligned_giou_loss(selected_boxes, target_boxes).mean()
         total = (
             cfg.anchor_weight * anchor_loss
-            + cfg.box_l1_weight * box_l1_loss
-            + cfg.giou_weight * giou_loss
             + cfg.warp_weight * warp_loss
-            + certainty_loss
-            + selection_loss
-            + ranking_loss
+            + cfg.best_box_weight * (box_l1_loss + giou_loss)
             + cfg.selected_box_weight * (selected_box_l1_loss + selected_giou_loss)
+            + cfg.certainty_weight * certainty_loss
+            + cfg.selection_weight * selection_loss
+            + cfg.ranking_weight * ranking_loss
         )
         return {
             "loss": total,
