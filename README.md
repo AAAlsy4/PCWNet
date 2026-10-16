@@ -8,7 +8,7 @@ Official implementation of the paper *PCWNet: Probabilistic Coarse-to-Fine Warp 
 
 ## Abstract
 
-> Cross-view object geo-localization (CVOGL) seeks the satellite-image bounding box of an object indicated by a point prompt in a Ground or Drone query. Viewpoint, scale, and appearance changes can leave several satellite regions equally plausible. Existing one-shot pipelines nevertheless commit to a single location without the chance for correction. We introduce the Probabilistic Coarse-to-Fine Warp Network (PCWNet), drawing its order of reasoning from remote-sensing image registration. The Prompt-conditioned Anchor Decoder does not treat the strongest anchor as a final answer; it retains the Top-*K* distinct modes of the anchor distribution. Each mode carries an object state with center, size, and certainty, which the Object Warp Refiner updates through candidate-conditioned local correlations across the feature pyramid. Only after these updates does the Cross-view Reranker compare prompt-local interactions, anchor evidence, geometry, certainty, and refinement history. In this way, PCWNet turns CVOGL into the progressive verification and calibration of multiple hypotheses. On the CVOGL test split, it reaches **80.68%** Acc@0.25 and **72.97%** Acc@0.50 for Drone-to-Satellite, surpassing ReCOT by 2.47 and 0.62 percentage points. Ground-to-Satellite Acc@0.25 is the best in the comparison at **53.34%**, while Acc@0.50 reaches 47.07%. The ablations associate these results with coarse candidate retention, multi-scale geometric correction, and cross-view selection.
+> Cross-view object geo-localization (CVOGL) seeks the satellite-image bounding box of an object indicated by a point prompt in a Ground or Drone query. Viewpoint, scale, and appearance changes can leave several satellite regions equally plausible. Existing one-shot pipelines nevertheless commit to a single location without the chance for correction. We propose the Probabilistic Coarse-to-Fine Warp Network (PCWNet), drawing its order of reasoning from remote-sensing image registration. The Prompt-conditioned Anchor Decoder does not treat the strongest anchor as a final answer; it retains the Top-$K$ distinct modes of the anchor score distribution. Each mode carries an object state with center, size, and a learned confidence score, which the Object Warp Refiner updates through candidate-conditioned local correlations across the feature pyramid. Only after these updates does the Cross-view Reranker compare prompt-local interactions, anchor evidence, geometry, confidence, and refinement history. In this way, PCWNet turns CVOGL into the progressive verification and calibration of multiple hypotheses. On the CVOGL test split, Drone-to-Satellite reaches $80.68\%$ Acc@0.25 and $71.74\%$ Acc@0.50, while Ground-to-Satellite reaches $52.31\%$ Acc@0.25 and $45.84\%$ Acc@0.50.
 
 ---
 
@@ -32,21 +32,17 @@ Official implementation of the paper *PCWNet: Probabilistic Coarse-to-Fine Warp 
 
 ### Pretrained Models
 
-| Model                      | Task                | Description                                | Link                                                                                              |
-| :------------------------- | :------------------ | :----------------------------------------- | :------------------------------------------------------------------------------------------------ |
-| `DroneAerial.pth`          | Drone-to-Satellite  | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/11JW1yKdkb3G0Rsve_dckMfkwEnNVaBqR/view?usp=drive_link) |
-| `DroneAerial_finetune.pth` | Drone-to-Satellite  | Train+val fine-tuned checkpoint            | [Download](https://drive.google.com/file/d/12y9fbpa5d6PmUYirfAYpL6BwxAyxnpnf/view?usp=drive_link) |
-| `SVI.pth`                  | Ground-to-Satellite | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/1ur_yeYJjRlXGOniH-rytHO-ZH6sqArPf/view?usp=drive_link) |
-| `SVI_finetune.pth`         | Ground-to-Satellite | Train+val fine-tuned checkpoint            | [Download](https://drive.google.com/file/d/123Biz7oAP59ZW2a7N-nR7-QR8Os__UQF/view?usp=drive_link) |
+| Model             | Task                | Description                                | Link                                                                                              |
+| :---------------- | :------------------ | :----------------------------------------- | :------------------------------------------------------------------------------------------------ |
+| `DroneAerial.pth` | Drone-to-Satellite  | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/11JW1yKdkb3G0Rsve_dckMfkwEnNVaBqR/view?usp=drive_link) |
+| `SVI.pth`         | Ground-to-Satellite | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/1ur_yeYJjRlXGOniH-rytHO-ZH6sqArPf/view?usp=drive_link) |
 
 Place the downloaded weights under `saved_models/`:
 
 ```text
 saved_models/
 ├── DroneAerial.pth
-├── DroneAerial_finetune.pth
-├── SVI.pth
-└── SVI_finetune.pth
+└── SVI.pth
 ```
 
 ### Dataset
@@ -121,17 +117,16 @@ python src/train.py --data_name CVOGL_SVI --checkpoint saved_models/SVI_best.pth
 
 Key options (`python src/train.py --help` for the full list):
 
-| Option              | Default                        | Description                               |
-| :------------------ | :----------------------------- | :---------------------------------------- |
-| `--data_root`       | `./data`                       | Dataset root directory                    |
-| `--data_name`       | `CVOGL_DroneAerial`            | `CVOGL_DroneAerial` or `CVOGL_SVI`        |
-| `--epochs`          | `40`                           | Main training epochs                      |
-| `--batch_size`      | `12`                           | Batch size                                |
-| `--lr`              | `1e-4`                         | Head learning rate                        |
-| `--backbone_lr`     | `1e-5`                         | Fine feature pyramid learning rate        |
-| `--topk`            | `7`                            | Number of retained candidate hypotheses   |
-| `--finetune_epochs` | `5`                            | Train+val fine-tuning epochs (0 disables) |
-| `--checkpoint`      | `saved_models/PCWNet_best.pth` | Where the best checkpoint is saved        |
+| Option          | Default                        | Description                             |
+| :-------------- | :----------------------------- | :-------------------------------------- |
+| `--data_root`   | `./data`                       | Dataset root directory                  |
+| `--data_name`   | `CVOGL_DroneAerial`            | `CVOGL_DroneAerial` or `CVOGL_SVI`      |
+| `--epochs`      | `40`                           | Main training epochs                    |
+| `--batch_size`  | `12`                           | Batch size                              |
+| `--lr`          | `1e-4`                         | Head learning rate                      |
+| `--backbone_lr` | `1e-5`                         | Fine feature pyramid learning rate      |
+| `--topk`        | `7`                            | Number of retained candidate hypotheses |
+| `--checkpoint`  | `saved_models/PCWNet_best.pth` | Where the best checkpoint is saved      |
 
 ### Evaluation
 
