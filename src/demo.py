@@ -165,8 +165,8 @@ def export_sample(model: PCWNet, dataset: RSDataset, index: int,
     save_rgb(output_dir / "03_coarse_topk_candidates.png", coarse_panel)
 
     level_names = list(model.refiners.keys())
-    for level, filename in (("layer3", "04_candidates_after_layer3.png"),
-                            ("layer1", "05_candidates_after_layer1.png")):
+    for level, filename in (("layer1", "04_candidates_after_layer1.png"),
+                            ("layer3", "05_candidates_after_layer3.png")):
         if level not in level_names:
             raise RuntimeError(f"Checkpoint model has no {level} refinement stage")
         state_index = level_names.index(level) + 1

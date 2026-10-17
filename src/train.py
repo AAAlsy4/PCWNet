@@ -37,8 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--topk", type=int, default=7)
-    parser.add_argument("--finetune_epochs", type=int, default=5)
-    parser.add_argument("--finetune_lr", type=float, default=None)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--checkpoint", default="saved_models/PCWNet_best.pth")
@@ -64,12 +62,8 @@ def validate_args(args: argparse.Namespace) -> None:
         return
     if args.epochs < 1:
         raise ValueError("--epochs must be at least 1")
-    if args.finetune_epochs < 0:
-        raise ValueError("--finetune_epochs cannot be negative")
     if args.lr <= 0 or args.backbone_lr <= 0 or args.min_lr < 0:
         raise ValueError("learning rates must be positive (--min_lr may be zero)")
-    if args.finetune_lr is not None and args.finetune_lr <= 0:
-        raise ValueError("--finetune_lr must be positive")
 
 
 def build_model(args: argparse.Namespace) -> PCWNet:
@@ -329,78 +323,6 @@ def load_checkpoint(path: str, model: torch.nn.Module) -> Dict[str, object]:
     return checkpoint
 
 
-def finetune_on_train_val(
-    args: argparse.Namespace,
-    model: PCWNet,
-    criterion: Criterion,
-    device: torch.device,
-) -> None:
-    """Fine-tune the best validation model on the combined train+val data."""
-    if args.finetune_epochs == 0:
-        print("train+val fine-tuning disabled", flush=True)
-        return
-
-    source = load_checkpoint(args.checkpoint, model)
-    source_epoch = int(source.get("epoch", -1))
-    source_metrics = source.get("metrics", {})
-    finetune_lr = args.finetune_lr
-    if finetune_lr is None:
-        finetune_lr = args.lr * 0.1
-    finetune_backbone_lr = args.backbone_lr * (finetune_lr / args.lr)
-
-    optimizer = build_optimizer(
-        args,
-        model,
-        lr=finetune_lr,
-        backbone_lr=finetune_backbone_lr,
-    )
-    scheduler = build_scheduler(
-        args,
-        optimizer,
-        epochs=args.finetune_epochs,
-        lr=finetune_lr,
-        warmup_epochs=0,
-    )
-    loader = build_train_val_loader(args)
-    print(f"loaded best checkpoint {args.checkpoint}", flush=True)
-
-    for finetune_epoch in range(args.finetune_epochs):
-        metrics = run_epoch(
-            model,
-            criterion,
-            loader,
-            optimizer,
-            device,
-            finetune_epoch,
-            args.print_freq,
-        )
-        current_lr = max(group["lr"] for group in optimizer.param_groups)
-        print(
-            f"finetune_epoch={finetune_epoch + 1}\n"
-            f"train+val={metrics}\nlr={current_lr:.6g}",
-            flush=True,
-        )
-        scheduler.step()
-        base, ext = os.path.splitext(args.checkpoint)
-        fine_checkpoint = f"{base}_fine_{finetune_epoch + 1}{ext}"
-        save_checkpoint(
-            fine_checkpoint,
-            model,
-            args.epochs + finetune_epoch,
-            metrics,
-            training_state={
-                "stage": "train_val_finetune",
-                "source_checkpoint": args.checkpoint,
-                "source_epoch": source_epoch,
-                "source_metrics": source_metrics,
-                "finetune_epoch": finetune_epoch,
-                "finetune_epochs": args.finetune_epochs,
-                "learning_rate": current_lr,
-            },
-        )
-        print(f"saved {fine_checkpoint}", flush=True)
-
-
 def main() -> None:
     """Run the configured training loop or one evaluation pass."""
     args = parse_args()
@@ -459,7 +381,6 @@ def main() -> None:
         f"score={best_score:.6f}",
         flush=True,
     )
-    finetune_on_train_val(args, model, criterion, device)
 
 
 if __name__ == "__main__":

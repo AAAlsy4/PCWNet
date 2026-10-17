@@ -40,7 +40,7 @@ class PCWNetConfig:
     # Each tuple is (normalized width, normalized height) for a query patch.
     query_patch_scales: Tuple[Tuple[float, float], ...] = ((0.25, 0.25),)
     local_softargmax_radius: int = 1
-    refinement_levels: Tuple[str, ...] = ("layer3", "layer2", "layer1")
+    refinement_levels: Tuple[str, ...] = ("layer1", "layer2", "layer3")
     refinement_dim: int = 256
     refinement_patch_size: int = 7
     min_box_size: float = 1.0 / 1024.0
@@ -67,7 +67,7 @@ class CoarseSemanticEncoder(nn.Module):
 class FineFeaturePyramid(nn.Module):
     """View-specific ResNet34 pyramid for object-level warp refinement."""
 
-    out_channels = {"layer1": 64, "layer2": 128, "layer3": 256}
+    out_channels = {"layer3": 64, "layer2": 128, "layer1": 256}
 
     def __init__(self, pretrained: bool) -> None:
         """Build the ResNet34 stem and three-level feature pyramid."""
@@ -76,20 +76,20 @@ class FineFeaturePyramid(nn.Module):
         base = models.resnet34(weights=weights)
         # Fine-grained feature backbone and pyramid stages.
         self.stem = nn.Sequential(base.conv1, base.bn1, base.relu, base.maxpool)
-        self.layer1 = base.layer1
+        self.layer3 = base.layer1
         self.layer2 = base.layer2
-        self.layer3 = base.layer3
+        self.layer1 = base.layer3
 
     def forward(self, images: torch.Tensor) -> TensorDict:
         """Return multi-scale feature maps for ``[B, 3, H, W]`` images."""
         x = self.stem(images)  # [B, 64, H/4, W/4]
-        layer1 = self.layer1(x)  # [B, 64, H/4, W/4]
-        layer2 = self.layer2(layer1)  # [B, 128, H/8, W/8]
-        layer3 = self.layer3(layer2)  # [B, 256, H/16, W/16]
+        layer3 = self.layer3(x)  # [B, 64, H/4, W/4]
+        layer2 = self.layer2(layer3)  # [B, 128, H/8, W/8]
+        layer1 = self.layer1(layer2)  # [B, 256, H/16, W/16]
         return {
-            "layer1": layer1,
-            "layer2": layer2,
             "layer3": layer3,
+            "layer2": layer2,
+            "layer1": layer1,
         }
 
 
@@ -544,7 +544,7 @@ class PCWNet(nn.Module):
         self.reranker = CrossViewReranker(
             query_channels=FineFeaturePyramid.out_channels,
             reference_channels=FineFeaturePyramid.out_channels,
-            levels=("layer3", "layer2"),
+            levels=("layer1", "layer2"),
             hidden_dim=cfg.reranker_dim,
             heads=cfg.reranker_heads,
             layers=cfg.reranker_layers,
@@ -594,8 +594,8 @@ class PCWNet(nn.Module):
         query_coarse = self._encode_coarse(query_images)  # [B, 768, Hq/32, Wq/32]
         reference_coarse = self._encode_coarse(reference_images)  # [B, 768, Hr/32, Wr/32]
         # Fine feature pyramids for local object-level refinement.
-        query_fine = self.query_fine_encoder(query_images)  # layer1/2/3: [B, 64/128/256, Hq/4/8/16, Wq/4/8/16]
-        reference_fine = self.reference_fine_encoder(reference_images)  # layer1/2/3: [B, 64/128/256, Hr/4/8/16, Wr/4/8/16]
+        query_fine = self.query_fine_encoder(query_images)  # layer3/2/1: [B, 64/128/256, Hq/4/8/16, Wq/4/8/16]
+        reference_fine = self.reference_fine_encoder(reference_images)  # layer3/2/1: [B, 64/128/256, Hr/4/8/16, Wr/4/8/16]
 
         # Prompt-conditioned coarse matching over the reference anchor grid.
         prompt_coarse = prompt_weighted_pool(query_coarse, prompt_map)  # [B, 768]

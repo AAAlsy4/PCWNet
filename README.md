@@ -34,8 +34,8 @@ Official implementation of the paper *PCWNet: Probabilistic Coarse-to-Fine Warp 
 
 | Model             | Task                | Description                                | Link                                                                                              |
 | :---------------- | :------------------ | :----------------------------------------- | :------------------------------------------------------------------------------------------------ |
-| `DroneAerial.pth` | Drone-to-Satellite  | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/11JW1yKdkb3G0Rsve_dckMfkwEnNVaBqR/view?usp=drive_link) |
-| `SVI.pth`         | Ground-to-Satellite | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/1ur_yeYJjRlXGOniH-rytHO-ZH6sqArPf/view?usp=drive_link) |
+| `DroneAerial.pth` | Drone-to-Satellite  | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/1r1sLfu3F5jZdlWJC5CskkFE_t1MqosFr/view?usp=drive_link) |
+| `SVI.pth`         | Ground-to-Satellite | Best validation checkpoint (main training) | [Download](https://drive.google.com/file/d/1_1u14Ypq1a9PBD4U_SPnXwpKjjYynqAM/view?usp=drive_link) |
 
 Place the downloaded weights under `saved_models/`:
 
