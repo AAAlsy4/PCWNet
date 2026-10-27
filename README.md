@@ -101,18 +101,18 @@ Dependencies (`requirements.txt`): `torch>=2.1`, `torchvision>=0.16`, `numpy`, `
 
 ## Training
 
-PCWNet trains the two CVOGL tasks **separately**. The default hyperparameters follow the paper: 40 epochs, batch size 12, head learning rate 1e-4, backbone learning rate 1e-5, 2 warm-up epochs, weight decay 5e-4, and 5 epochs of train+val fine-tuning after model selection.
+PCWNet trains the two CVOGL tasks **separately**. The default hyperparameters follow the paper: 40 epochs, batch size 12, head learning rate 1e-4, backbone learning rate 1e-5 and 2 warm-up epochs.
 
 ### Drone-to-Satellite
 
 ```bash
-python src/train.py --data_name CVOGL_DroneAerial --checkpoint saved_models/DroneAerial_best.pth
+python src/train.py --data_name CVOGL_DroneAerial --checkpoint saved_models/DroneAerial.pth
 ```
 
 ### Ground-to-Satellite
 
 ```bash
-python src/train.py --data_name CVOGL_SVI --checkpoint saved_models/SVI_best.pth
+python src/train.py --data_name CVOGL_SVI --checkpoint saved_models/SVI.pth
 ```
 
 Key options (`python src/train.py --help` for the full list):
@@ -134,10 +134,10 @@ Evaluate a trained checkpoint on the validation or test split:
 
 ```bash
 # Drone-to-Satellite
-python src/train.py --data_name CVOGL_DroneAerial --eval --resume saved_models/DroneAerial_best.pth --split test
+python src/train.py --data_name CVOGL_DroneAerial --eval --resume saved_models/DroneAerial.pth --split test
 
 # Ground-to-Satellite
-python src/train.py --data_name CVOGL_SVI --eval --resume saved_models/SVI_best.pth --split test
+python src/train.py --data_name CVOGL_SVI --eval --resume saved_models/SVI.pth --split test
 ```
 
 Reported metrics include `iou`, `acc25`, `acc50`, and the candidate-level `oracle_*` / `selection_*` diagnostics.
@@ -149,7 +149,7 @@ Reported metrics include `iou`, `acc25`, `acc50`, and the candidate-level `oracl
 `src/demo.py` runs a single sample through the model and exports the candidate lifecycle as a set of images (point prompt, ground truth, coarse Top-K candidates, layer3/layer1 refinement, and the final reranked prediction).
 
 ```bash
-python src/demo.py --data_name CVOGL_DroneAerial --split test --index 0 --checkpoint saved_models/DroneAerial_best.pth --save_dir vis
+python src/demo.py --data_name CVOGL_DroneAerial --split test --index 0 --checkpoint saved_models/DroneAerial.pth --save_dir vis
 ```
 
 This writes `01_query_point_prompt.png` … `06_final_reranked_prediction.png` into `vis/`.
